@@ -797,7 +797,33 @@ function App() {
           (entry) =>
             !entry.isDir && entry.name.toLowerCase().endsWith(".cpp"),
         );
-        if (firstCpp) await openFile(firstCpp.path);
+        if (firstCpp) {
+          await openFile(firstCpp.path);
+        } else {
+          const srcDir = rootEntries.find(
+            (entry) => entry.isDir && entry.name === "src",
+          );
+          if (srcDir) {
+            const srcEntries = await invoke<FileEntry[]>("list_dir", {
+              path: srcDir.path,
+            });
+            setDirs((previous) => ({
+              ...previous,
+              [srcDir.path]: srcEntries,
+            }));
+            setExpanded((previous) => {
+              const next = new Set(previous);
+              next.add(srcDir.path);
+              return next;
+            });
+            const srcCpp = srcEntries.find(
+              (entry) =>
+                !entry.isDir &&
+                entry.name.toLowerCase().endsWith(".cpp"),
+            );
+            if (srcCpp) await openFile(srcCpp.path);
+          }
+        }
       } catch (error) {
         setStatus("打开工作区失败");
         setOutput(String(error));
@@ -815,19 +841,36 @@ function App() {
     if (typeof selected === "string") await openWorkspace(selected);
   }, [openWorkspace]);
 
-  const openExample = useCallback(async () => {
-    try {
-      const path = await invoke<string | null>("example_workspace");
-      if (path) {
-        await openWorkspace(path);
-      } else {
-        setStatus("未找到 examples/hello 示例项目");
+  const openExampleCommand = useCallback(
+    async (command: string, label: string) => {
+      try {
+        const path = await invoke<string | null>(command);
+        if (path) {
+          await openWorkspace(path);
+        } else {
+          setStatus(`未找到 ${label} 示例项目`);
+        }
+      } catch (error) {
+        setStatus("打开示例失败");
+        setOutput(String(error));
       }
-    } catch (error) {
-      setStatus("打开示例失败");
-      setOutput(String(error));
-    }
-  }, [openWorkspace]);
+    },
+    [openWorkspace],
+  );
+
+  const openExample = useCallback(
+    () => openExampleCommand("example_workspace", "examples/hello"),
+    [openExampleCommand],
+  );
+
+  const openCmakeExample = useCallback(
+    () =>
+      openExampleCommand(
+        "cmake_example_workspace",
+        "examples/cmake-hello",
+      ),
+    [openExampleCommand],
+  );
 
   useEffect(() => {
     if (!import.meta.env.DEV || autoOpenedRef.current) return;
@@ -901,6 +944,9 @@ function App() {
         </button>
         <button type="button" onClick={() => void openExample()}>
           打开示例
+        </button>
+        <button type="button" onClick={() => void openCmakeExample()}>
+          CMake 示例
         </button>
         <button
           type="button"

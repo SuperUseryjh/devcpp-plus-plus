@@ -3,7 +3,7 @@ use std::{
     ffi::OsString,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Output, Stdio},
     time::Instant,
 };
 
@@ -69,8 +69,12 @@ struct ToolchainInfo {
     gxx: Option<String>,
     gdb: Option<String>,
     clangd: Option<String>,
+    cmake: Option<String>,
+    ninja: Option<String>,
     gxx_version: Option<String>,
     clangd_version: Option<String>,
+    cmake_version: Option<String>,
+    ninja_version: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -95,7 +99,17 @@ struct BuildResult {
 #[tauri::command]
 async fn open_workspace(root: String) -> Result<WorkspaceInfo, String> {
     let root = normalize_existing_dir(&root)?;
-    let db = ensure_compile_commands(&root)?;
+    let db = if root.join("CMakeLists.txt").is_file() {
+        match configure_cmake(&root).await {
+            Ok(dir) => Some(dir),
+            Err(err) => {
+                eprintln!("[cmake] {}", err);
+                compile_commands_dir(&root)
+            }
+        }
+    } else {
+        ensure_compile_commands(&root)?
+    };
     let sources = collect_sources(&root).len();
     Ok(WorkspaceInfo {
         root: root.display().to_string(),
@@ -200,20 +214,35 @@ fn detect_toolchain() -> ToolchainInfo {
     let gxx = find_gxx();
     let gdb = find_tool("gdb");
     let clangd = find_clangd();
+    let cmake = find_cmake();
+    let ninja = find_ninja();
     ToolchainInfo {
         gxx_version: gxx.as_ref().and_then(|path| version_of(path)),
         clangd_version: clangd.as_ref().and_then(|path| version_of(path)),
+        cmake_version: cmake.as_ref().and_then(|path| version_of(path)),
+        ninja_version: ninja.as_ref().and_then(|path| version_of(path)),
         gxx: gxx.map(|path| path.display().to_string()),
         gdb: gdb.map(|path| path.display().to_string()),
         clangd: clangd.map(|path| path.display().to_string()),
+        cmake: cmake.map(|path| path.display().to_string()),
+        ninja: ninja.map(|path| path.display().to_string()),
     }
 }
 
 #[tauri::command]
 fn example_workspace() -> Option<String> {
+    example_path("examples/hello")
+}
+
+#[tauri::command]
+fn cmake_example_workspace() -> Option<String> {
+    example_path("examples/cmake-hello")
+}
+
+fn example_path(relative: &str) -> Option<String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()?
-        .join("examples/hello");
+        .join(relative);
     if path.is_dir() {
         Some(path.display().to_string())
     } else {
@@ -350,6 +379,9 @@ async fn build_and_run(
     if !file.is_file() {
         return Err(format!("文件不存在: {}", file.display()));
     }
+    if root.join("CMakeLists.txt").is_file() {
+        return build_and_run_cmake(&root, stdin).await;
+    }
     let gxx = find_gxx().ok_or_else(|| "未找到 g++.exe，请检查 PATH".to_string())?;
     let out_dir = build_output_dir(&root);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建构建目录失败: {}", e))?;
@@ -407,8 +439,28 @@ async fn build_and_run(
         });
     }
 
-    let mut run = TokioCommand::new(&exe);
-    run.current_dir(&root)
+    let executed = run_program(&exe, &root, &gxx, stdin).await?;
+    output.push_str("\n--- 程序输出 ---\n");
+    output.push_str(&decode_output(&executed.stdout));
+    output.push_str(&decode_output(&executed.stderr));
+
+    Ok(BuildResult {
+        success: true,
+        output,
+        exit_code: executed.status.code().unwrap_or(-1),
+        executable: Some(exe.display().to_string()),
+        duration_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+async fn run_program(
+    exe: &Path,
+    root: &Path,
+    gxx: &Path,
+    stdin: Option<String>,
+) -> Result<Output, String> {
+    let mut run = TokioCommand::new(exe);
+    run.current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if stdin.is_some() {
@@ -435,10 +487,73 @@ async fn build_and_run(
                 .map_err(|e| format!("关闭程序 stdin 失败: {}", e))?;
         }
     }
-    let executed = child
+    child
         .wait_with_output()
         .await
-        .map_err(|e| format!("等待程序结束失败: {}", e))?;
+        .map_err(|e| format!("等待程序结束失败: {}", e))
+}
+
+async fn build_and_run_cmake(
+    root: &Path,
+    stdin: Option<String>,
+) -> Result<BuildResult, String> {
+    let start = Instant::now();
+    let gxx = find_gxx().ok_or_else(|| "未找到 g++.exe，请检查 PATH".to_string())?;
+    let build_dir = match configure_cmake(root).await {
+        Ok(dir) => dir,
+        Err(err) => {
+            return Ok(BuildResult {
+                success: false,
+                output: err,
+                exit_code: -1,
+                executable: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+    };
+    let cmake = find_cmake().ok_or_else(|| "未找到 cmake.exe".to_string())?;
+    let mut cmd = TokioCommand::new(&cmake);
+    cmd.current_dir(root)
+        .arg("--build")
+        .arg(&build_dir)
+        .arg("--parallel")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("CLICOLOR", "0")
+        .env("NO_COLOR", "1");
+    if let Some(path) = path_with_prefix(gxx.parent()) {
+        cmd.env("PATH", path);
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+
+    let build = cmd
+        .output()
+        .await
+        .map_err(|e| format!("启动 cmake 失败: {}", e))?;
+    let mut output = format!("> cmake --build {}\n", build_dir.display());
+    output.push_str(&decode_output(&build.stdout));
+    output.push_str(&decode_output(&build.stderr));
+    if !build.status.success() {
+        return Ok(BuildResult {
+            success: false,
+            output,
+            exit_code: build.status.code().unwrap_or(-1),
+            executable: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
+    }
+
+    let exe = find_cmake_executable(&build_dir).ok_or_else(|| {
+        format!(
+            "CMake 构建成功，但未在 {} 找到可执行文件",
+            build_dir.display()
+        )
+    })?;
+    let executed = run_program(&exe, root, &gxx, stdin).await?;
     output.push_str("\n--- 程序输出 ---\n");
     output.push_str(&decode_output(&executed.stdout));
     output.push_str(&decode_output(&executed.stderr));
@@ -450,6 +565,118 @@ async fn build_and_run(
         executable: Some(exe.display().to_string()),
         duration_ms: start.elapsed().as_millis() as u64,
     })
+}
+
+async fn configure_cmake(root: &Path) -> Result<PathBuf, String> {
+    let build_dir = cmake_build_dir(root);
+    if build_dir.join("CMakeCache.txt").is_file() {
+        return Ok(build_dir);
+    }
+    std::fs::create_dir_all(&build_dir)
+        .map_err(|e| format!("创建 CMake 构建目录失败: {}", e))?;
+    let cmake = find_cmake().ok_or_else(|| "未找到 cmake.exe".to_string())?;
+    let gxx = find_gxx().ok_or_else(|| "未找到 g++.exe".to_string())?;
+    let gcc = find_gcc().unwrap_or_else(|| gxx.with_file_name("gcc.exe"));
+    let bin_dir = build_dir.join("bin");
+
+    let mut cmd = TokioCommand::new(&cmake);
+    cmd.current_dir(root)
+        .arg("-S")
+        .arg(root)
+        .arg("-B")
+        .arg(&build_dir)
+        .arg("-DCMAKE_BUILD_TYPE=Debug")
+        .arg("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
+        .arg("-DCMAKE_COLOR_DIAGNOSTICS=OFF")
+        .arg(format!(
+            "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={}",
+            bin_dir.display()
+        ))
+        .arg(format!("-DCMAKE_C_COMPILER={}", gcc.display()))
+        .arg(format!("-DCMAKE_CXX_COMPILER={}", gxx.display()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("CLICOLOR", "0")
+        .env("NO_COLOR", "1");
+    if let Some(ninja) = find_ninja() {
+        cmd.arg("-G").arg("Ninja");
+        cmd.arg(format!("-DCMAKE_MAKE_PROGRAM={}", ninja.display()));
+    } else if let Some(make) = find_tool("mingw32-make").or_else(|| find_tool("make")) {
+        cmd.arg("-G").arg("MinGW Makefiles");
+        cmd.arg(format!("-DCMAKE_MAKE_PROGRAM={}", make.display()));
+    } else {
+        return Err("未找到 Ninja 或 mingw32-make，无法配置 CMake 项目".to_string());
+    }
+    if let Some(path) = path_with_prefix(gxx.parent()) {
+        cmd.env("PATH", path);
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+
+    let configured = cmd
+        .output()
+        .await
+        .map_err(|e| format!("启动 cmake 配置失败: {}", e))?;
+    if !configured.status.success() {
+        return Err(format!(
+            "CMake 配置失败 (exit {}):\n{}\n{}",
+            configured.status.code().unwrap_or(-1),
+            decode_output(&configured.stdout),
+            decode_output(&configured.stderr)
+        ));
+    }
+    Ok(build_dir)
+}
+
+fn cmake_build_dir(root: &Path) -> PathBuf {
+    build_output_dir(root).join("cmake")
+}
+
+fn find_cmake_executable(build_dir: &Path) -> Option<PathBuf> {
+    let bin = build_dir.join("bin");
+    let base = if bin.is_dir() { bin.as_path() } else { build_dir };
+    let mut executables = Vec::new();
+    collect_executables(base, &mut executables, 0);
+    executables.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    executables.pop()
+}
+
+fn collect_executables(dir: &Path, executables: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name == "CMakeFiles")
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            collect_executables(&path, executables, depth + 1);
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("exe"))
+            .unwrap_or(false)
+        {
+            executables.push(path);
+        }
+    }
 }
 
 fn normalize_existing_dir(path: &str) -> Result<PathBuf, String> {
@@ -489,6 +716,9 @@ fn decode_output(bytes: &[u8]) -> String {
 }
 
 fn ensure_compile_commands(root: &Path) -> Result<Option<PathBuf>, String> {
+    if root.join("CMakeLists.txt").is_file() {
+        return Ok(compile_commands_dir(root));
+    }
     if root.join("compile_commands.json").is_file() {
         return Ok(Some(root.to_path_buf()));
     }
@@ -536,12 +766,19 @@ fn ensure_compile_commands(root: &Path) -> Result<Option<PathBuf>, String> {
 
 fn compile_commands_dir(root: &Path) -> Option<PathBuf> {
     if root.join("compile_commands.json").is_file() {
-        Some(root.to_path_buf())
-    } else if root.join(".devcpp/compile_commands.json").is_file() {
-        Some(root.join(".devcpp"))
-    } else {
-        None
+        return Some(root.to_path_buf());
     }
+    let cmake = cmake_build_dir(root);
+    if cmake.join("compile_commands.json").is_file() {
+        return Some(cmake);
+    }
+    if root.join("build/compile_commands.json").is_file() {
+        return Some(root.join("build"));
+    }
+    if root.join(".devcpp/compile_commands.json").is_file() {
+        return Some(root.join(".devcpp"));
+    }
+    None
 }
 
 fn collect_sources(root: &Path) -> Vec<PathBuf> {
@@ -628,6 +865,70 @@ fn find_clangd() -> Option<PathBuf> {
     which::which("clangd")
         .ok()
         .or_else(|| which::which("clangd.exe").ok())
+}
+
+fn find_cmake() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("DEVCPP_CMAKE") {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let dev_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/cmake/bin/cmake.exe");
+    if dev_path.is_file() {
+        return Some(dev_path);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("tools/cmake/bin/cmake.exe");
+            if bundled.is_file() {
+                return Some(bundled);
+            }
+        }
+    }
+    which::which("cmake")
+        .ok()
+        .or_else(|| which::which("cmake.exe").ok())
+}
+
+fn find_ninja() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("DEVCPP_NINJA") {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let dev_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/ninja/ninja.exe");
+    if dev_path.is_file() {
+        return Some(dev_path);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("tools/ninja/ninja.exe");
+            if bundled.is_file() {
+                return Some(bundled);
+            }
+        }
+    }
+    which::which("ninja")
+        .ok()
+        .or_else(|| which::which("ninja.exe").ok())
+}
+
+fn find_gcc() -> Option<PathBuf> {
+    if let Some(gxx) = find_gxx() {
+        if let Some(parent) = gxx.parent() {
+            let gcc = parent.join("gcc.exe");
+            if gcc.is_file() {
+                return Some(gcc);
+            }
+        }
+    }
+    which::which("gcc.exe")
+        .ok()
+        .or_else(|| which::which("gcc").ok())
 }
 
 fn find_gxx() -> Option<PathBuf> {
@@ -832,6 +1133,7 @@ pub fn run() {
             save_text_file,
             detect_toolchain,
             example_workspace,
+            cmake_example_workspace,
             start_lsp,
             stop_lsp,
             build_and_run
@@ -948,6 +1250,43 @@ int main() {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn build_and_run_cmake_example() {
+        if find_cmake().is_none() || find_ninja().is_none() {
+            eprintln!("skipping CMake test: cmake/ninja not found");
+            return;
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri parent")
+            .join("examples/cmake-hello");
+        let result = build_and_run(
+            root.display().to_string(),
+            root.join("src/main.cpp").display().to_string(),
+            None,
+        )
+        .await
+        .expect("build_and_run CMake example");
+
+        assert!(result.success, "CMake build failed:
+{}", result.output);
+        assert!(
+            result.output.contains("Hello from CMake"),
+            "CMake program output missing:
+{}",
+            result.output
+        );
+        assert!(
+            cmake_build_dir(&root).join("compile_commands.json").is_file(),
+            "CMake did not generate compile_commands.json"
+        );
+        assert_eq!(
+            compile_commands_dir(&root),
+            Some(cmake_build_dir(&root)),
+            "compile_commands_dir should point at the CMake build directory"
+        );
     }
 
     #[tokio::test]

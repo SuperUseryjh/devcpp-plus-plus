@@ -21,8 +21,12 @@ export interface ToolchainInfo {
   gxx?: string;
   gdb?: string;
   clangd?: string;
+  cmake?: string;
+  ninja?: string;
   gxxVersion?: string;
   clangdVersion?: string;
+  cmakeVersion?: string;
+  ninjaVersion?: string;
 }
 
 export interface LspInfo {

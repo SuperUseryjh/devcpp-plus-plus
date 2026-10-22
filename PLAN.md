@@ -1475,7 +1475,8 @@ base-uri 'self';
 | GDB | 14.1（MSYS2 UCRT64） |
 | clangd | 20.1.8（`tools/clangd`，由 `scripts/fetch-clangd.ps1` 下载） |
 | clang-format / clang-tidy | **未安装** |
-| CMake / Ninja | **未安装** |
+| CMake | 4.2.0（`tools/cmake`） |
+| Ninja | 1.13.2（`tools/ninja`） |
 | Git | 2.55.0 |
 | 控制台代码页 | 936（GBK）；bash `LC_CTYPE=C.UTF-8` |
 | `link.exe` | 当前 PATH 首先命中 Git 的 `/usr/bin/link`（Rust MSVC 构建风险；本机 `cargo build/test` 已通过） |
@@ -1488,9 +1489,10 @@ base-uri 'self';
 - 自动生成 `.devcpp/compile_commands.json`；
 - clangd 20.1.8 初始化成功，诊断 0 误报，补全返回 56 个候选；
 - g++ 编译运行输出 `Hello from DevCpp++! total = 6`；
+- CMake 4.2.0 + Ninja 1.13.2 配置/构建/运行 `examples/cmake-hello` 成功；
 - 多标签页、格式化、引用、文档符号、折叠、最近工作区、stdin 文本框已接入；
 - 中文临时路径构建测试通过（构建目录回退到 ASCII）；
-- `cargo test` 4 项通过（含 stdin、中文路径）；`npm run build` 成功；
+- `cargo test` 5 项通过（含 stdin、中文路径、CMake）；`npm run build` 成功；
 - 应用退出后 clangd 无残留。
 
 详细记录见 [`docs/P0_REPORT.md`](./docs/P0_REPORT.md)。

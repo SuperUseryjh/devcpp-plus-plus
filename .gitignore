@@ -31,3 +31,5 @@ examples/*/.devcpp/
 # Local P0 artifacts
 .tmp-*
 *.msi
+
+examples/*/.devcpp/
