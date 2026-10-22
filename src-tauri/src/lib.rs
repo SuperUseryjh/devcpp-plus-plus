@@ -340,7 +340,11 @@ async fn stop_lsp(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn build_and_run(root: String, file: String) -> Result<BuildResult, String> {
+async fn build_and_run(
+    root: String,
+    file: String,
+    stdin: Option<String>,
+) -> Result<BuildResult, String> {
     let root = normalize_existing_dir(&root)?;
     let file = PathBuf::from(file);
     if !file.is_file() {
@@ -405,19 +409,36 @@ async fn build_and_run(root: String, file: String) -> Result<BuildResult, String
 
     let mut run = TokioCommand::new(&exe);
     run.current_dir(&root)
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if stdin.is_some() {
+        run.stdin(Stdio::piped());
+    } else {
+        run.stdin(Stdio::null());
+    }
     if let Some(path) = path_with_prefix(gxx.parent()) {
         run.env("PATH", path);
     }
     #[cfg(windows)]
     run.creation_flags(0x0800_0000);
 
-    let executed = run
-        .output()
-        .await
+    let mut child = run
+        .spawn()
         .map_err(|e| format!("运行程序失败: {}", e))?;
+    if let Some(input) = stdin {
+        if let Some(mut pipe) = child.stdin.take() {
+            pipe.write_all(input.as_bytes())
+                .await
+                .map_err(|e| format!("写入程序 stdin 失败: {}", e))?;
+            pipe.shutdown()
+                .await
+                .map_err(|e| format!("关闭程序 stdin 失败: {}", e))?;
+        }
+    }
+    let executed = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("等待程序结束失败: {}", e))?;
     output.push_str("\n--- 程序输出 ---\n");
     output.push_str(&decode_output(&executed.stdout));
     output.push_str(&decode_output(&executed.stderr));
@@ -846,6 +867,7 @@ mod tests {
         let result = build_and_run(
             root.display().to_string(),
             file.display().to_string(),
+            None,
         )
         .await
         .expect("build_and_run should not fail at the command boundary");
@@ -874,6 +896,7 @@ mod tests {
         let result = build_and_run(
             base.display().to_string(),
             base.join("main.cpp").display().to_string(),
+            None,
         )
         .await
         .expect("build_and_run in chinese path");
@@ -882,6 +905,45 @@ mod tests {
         assert!(
             result.output.contains("Hello from DevCpp++"),
             "program output missing:\n{}",
+            result.output
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn build_and_run_with_stdin() {
+        let base = std::env::temp_dir().join(format!(
+            "devcpp-stdin-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("create stdin temp dir");
+        std::fs::write(
+            base.join("main.cpp"),
+            r#"#include <iostream>
+int main() {
+    int value = 0;
+    if (std::cin >> value) {
+        std::cout << (value * 2) << "\n";
+    }
+    return 0;
+}
+"#,
+        )
+        .expect("write stdin program");
+
+        let result = build_and_run(
+            base.display().to_string(),
+            base.join("main.cpp").display().to_string(),
+            Some("21\n".to_string()),
+        )
+        .await
+        .expect("build_and_run with stdin");
+
+        assert!(result.success, "build failed:\n{}", result.output);
+        assert!(
+            result.output.contains("42"),
+            "stdin was not forwarded:\n{}",
             result.output
         );
 
@@ -1004,7 +1066,7 @@ mod tests {
                 "id": 2,
                 "method": "textDocument/completion",
                 "params": {
-                    "textDocument": { "uri": file_uri },
+                    "textDocument": { "uri": file_uri.clone() },
                     "position": { "line": 9, "character": 10 }
                 }
             })
@@ -1046,6 +1108,62 @@ mod tests {
             "unexpected completion labels: {:?}",
             labels
         );
+
+        for (id, method, params) in [
+            (
+                3,
+                "textDocument/formatting",
+                json!({
+                    "textDocument": { "uri": file_uri.clone() },
+                    "options": { "tabSize": 4, "insertSpaces": true }
+                }),
+            ),
+            (
+                4,
+                "textDocument/documentSymbol",
+                json!({ "textDocument": { "uri": file_uri.clone() } }),
+            ),
+            (
+                5,
+                "textDocument/foldingRange",
+                json!({ "textDocument": { "uri": file_uri.clone() } }),
+            ),
+        ] {
+            ws.send(Message::text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("send LSP feature request");
+
+            let mut result: Option<Value> = None;
+            for _ in 0..60 {
+                let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                    .await
+                    .expect("LSP feature timeout")
+                    .expect("websocket closed")
+                    .expect("websocket error");
+                if let Message::Text(text) = message {
+                    let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                    if value.get("id") == Some(&json!(id)) {
+                        result = value.get("result").cloned();
+                        break;
+                    }
+                }
+            }
+            let result = result.unwrap_or_else(|| panic!("missing result for {}", method));
+            assert!(
+                result.is_array(),
+                "expected array result for {}, got {}",
+                method,
+                result
+            );
+        }
 
         let _ = handle.shutdown.send(());
     }

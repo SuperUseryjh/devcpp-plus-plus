@@ -10,12 +10,14 @@
 ## 已实现（P0）
 
 - Tauri 桌面窗口 + React 布局 + Monaco C++ 编辑器
-- 打开文件夹 / 文件树 / 标签页 / 保存
+- 打开文件夹 / 文件树 / 多标签页 / 保存 / 最近工作区
 - 工作区扫描 + 自动生成 `.devcpp/compile_commands.json`
 - clangd 20.1.8 LSP over loopback WebSocket
   - 诊断（Problems + Monaco markers）
   - 补全、悬停、跳转定义
 - g++ 单文件编译 + 运行，输出面板显示 stdout/stderr
+- 标准输入文本框（运行前写入 stdin）
+- 格式化（clangd）、引用查找、文档符号/面包屑、代码折叠
 - 工具链检测（g++ / gdb / clangd 版本）
 - 编码检测（UTF-8 / UTF-16 BOM / GBK 回退）
 - 中文路径构建：原生路径分隔符 + ASCII 构建目录
@@ -68,7 +70,10 @@ Rust 测试覆盖：
 | `F11` | 编译并运行当前文件 |
 | `Ctrl+S` | 保存 |
 | `Ctrl+Space` | 触发补全（由 Monaco/clangd 提供） |
+| `Ctrl+W` | 关闭当前标签页 |
+| `Shift+Alt+F` | 格式化当前文件 |
 | `F12` | 跳转定义（Monaco 默认） |
+| `Shift+F12` | 查找引用 |
 
 ## 目录
 
@@ -87,7 +92,7 @@ tools/clangd/        本地 clangd（git 忽略，由脚本下载）
 ## 已知限制（P0）
 
 - 没有调试器、集成终端、Git、设置 UI、搜索、重命名/代码操作
-- 构建仅支持单文件；CMake 模式尚未接入
+- 构建目前支持单文件；CMake 模式正在接入
 - Monaco 目前全量引入，前端产物约 4 MB gzip 1.1 MB，后续按需裁剪
 - clangd 使用 `--background-index`，大项目索引会占用 CPU/内存
 - 中文输入法（IME）组合输入仍需人工回归测试

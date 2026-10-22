@@ -1488,8 +1488,9 @@ base-uri 'self';
 - 自动生成 `.devcpp/compile_commands.json`；
 - clangd 20.1.8 初始化成功，诊断 0 误报，补全返回 56 个候选；
 - g++ 编译运行输出 `Hello from DevCpp++! total = 6`；
+- 多标签页、格式化、引用、文档符号、折叠、最近工作区、stdin 文本框已接入；
 - 中文临时路径构建测试通过（构建目录回退到 ASCII）；
-- `cargo test` 3 项通过；`npm run build` 成功；
+- `cargo test` 4 项通过（含 stdin、中文路径）；`npm run build` 成功；
 - 应用退出后 clangd 无残留。
 
 详细记录见 [`docs/P0_REPORT.md`](./docs/P0_REPORT.md)。

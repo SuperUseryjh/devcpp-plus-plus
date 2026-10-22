@@ -32,7 +32,8 @@ button {
 }
 
 .app {
-  height: 100%;
+  height: 100vh;
+  overflow: hidden;
   display: grid;
   grid-template-rows: 44px minmax(0, 1fr) 220px 24px;
   background: #1e1e1e;
@@ -371,4 +372,100 @@ button {
 
 .statusbar-spacer {
   flex: 1;
+}
+
+.stdin-input {
+  flex: none;
+  height: 48px;
+  margin: 0 10px 8px;
+  padding: 6px 8px;
+  resize: vertical;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  background: #252526;
+  color: #d4d4d4;
+  font-family: Consolas, "Cascadia Code", "Microsoft YaHei", monospace;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.stdin-input:focus {
+  outline: 1px solid #007acc;
+  outline-offset: -1px;
+}
+
+.tabbar {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.tab {
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tab.active {
+  border-top: 2px solid #007acc;
+  padding-top: 2px;
+}
+
+.tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #9d9d9d;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tab-close:hover {
+  background: #3a3d3e;
+  color: #fff;
+}
+
+.recent {
+  margin-top: 12px;
+}
+
+.recent-title {
+  margin-bottom: 4px;
+  color: #8a8a8a;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.recent-row {
+  display: block;
+  width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #bdbdbd;
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.recent-row:hover {
+  background: #2a2d2e;
+  color: #fff;
 }

@@ -76,6 +76,23 @@ export interface LocationLink {
   originSelectionRange?: Range;
 }
 
+export interface DocumentSymbol {
+  name: string;
+  detail?: string;
+  kind: number;
+  range: Range;
+  selectionRange: Range;
+  children?: DocumentSymbol[];
+}
+
+export interface FoldingRange {
+  startLine: number;
+  startCharacter?: number;
+  endLine: number;
+  endCharacter?: number;
+  kind?: string;
+}
+
 class WebSocketReader extends AbstractMessageReader implements MessageReader {
   private cleanups: Array<() => void> = [];
 
@@ -380,6 +397,54 @@ export class LspClient {
       textDocument: { uri },
       position: { line, character },
     });
+  }
+
+  async references(
+    uri: string,
+    line: number,
+    character: number,
+    includeDeclaration: boolean,
+  ): Promise<Location[]> {
+    const result = await this.connection.sendRequest<
+      Location[] | null
+    >("textDocument/references", {
+      textDocument: { uri },
+      position: { line, character },
+      context: { includeDeclaration },
+    });
+    return result ?? [];
+  }
+
+  async formatting(
+    uri: string,
+    tabSize: number,
+    insertSpaces: boolean,
+  ): Promise<TextEdit[]> {
+    const result = await this.connection.sendRequest<
+      TextEdit[] | null
+    >("textDocument/formatting", {
+      textDocument: { uri },
+      options: { tabSize, insertSpaces },
+    });
+    return result ?? [];
+  }
+
+  async documentSymbols(uri: string): Promise<DocumentSymbol[]> {
+    const result = await this.connection.sendRequest<
+      DocumentSymbol[] | null
+    >("textDocument/documentSymbol", {
+      textDocument: { uri },
+    });
+    return result ?? [];
+  }
+
+  async foldingRanges(uri: string): Promise<FoldingRange[]> {
+    const result = await this.connection.sendRequest<
+      FoldingRange[] | null
+    >("textDocument/foldingRange", {
+      textDocument: { uri },
+    });
+    return result ?? [];
   }
 
   dispose(): void {

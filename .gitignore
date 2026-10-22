@@ -24,7 +24,7 @@ dist-ssr
 *.sw?
 
 # Local P0 toolchain (not committed)
-tools/clangd/
+tools/
 .devcpp/
 examples/*/.devcpp/
 

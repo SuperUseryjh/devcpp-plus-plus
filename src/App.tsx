@@ -15,6 +15,8 @@ import {
   uriToPath,
   type CompletionItem,
   type Diagnostic,
+  type DocumentSymbol,
+  type FoldingRange,
   type Hover,
   type Range,
 } from "./lsp/client";
@@ -72,6 +74,67 @@ const COMPLETION_KINDS: monaco.languages.CompletionItemKind[] = [
   monaco.languages.CompletionItemKind.Operator,
   monaco.languages.CompletionItemKind.TypeParameter,
 ];
+
+const SYMBOL_KINDS: monaco.languages.SymbolKind[] = [
+  monaco.languages.SymbolKind.File,
+  monaco.languages.SymbolKind.Module,
+  monaco.languages.SymbolKind.Namespace,
+  monaco.languages.SymbolKind.Package,
+  monaco.languages.SymbolKind.Class,
+  monaco.languages.SymbolKind.Method,
+  monaco.languages.SymbolKind.Property,
+  monaco.languages.SymbolKind.Field,
+  monaco.languages.SymbolKind.Constructor,
+  monaco.languages.SymbolKind.Enum,
+  monaco.languages.SymbolKind.Interface,
+  monaco.languages.SymbolKind.Function,
+  monaco.languages.SymbolKind.Variable,
+  monaco.languages.SymbolKind.Constant,
+  monaco.languages.SymbolKind.String,
+  monaco.languages.SymbolKind.Number,
+  monaco.languages.SymbolKind.Boolean,
+  monaco.languages.SymbolKind.Array,
+  monaco.languages.SymbolKind.Object,
+  monaco.languages.SymbolKind.Key,
+  monaco.languages.SymbolKind.Null,
+  monaco.languages.SymbolKind.EnumMember,
+  monaco.languages.SymbolKind.Struct,
+  monaco.languages.SymbolKind.Event,
+  monaco.languages.SymbolKind.Operator,
+  monaco.languages.SymbolKind.TypeParameter,
+];
+
+function toMonacoSymbol(
+  symbol: DocumentSymbol,
+): monaco.languages.DocumentSymbol {
+  return {
+    name: symbol.name,
+    detail: symbol.detail ?? "",
+    kind:
+      SYMBOL_KINDS[(symbol.kind ?? 1) - 1] ??
+      monaco.languages.SymbolKind.Variable,
+    range: toMonacoRange(symbol.range),
+    selectionRange: toMonacoRange(symbol.selectionRange),
+    tags: [],
+    children: symbol.children?.map(toMonacoSymbol),
+  };
+}
+
+function toFoldingRange(range: FoldingRange): monaco.languages.FoldingRange {
+  let kind: monaco.languages.FoldingRangeKind | undefined;
+  if (range.kind === "comment") {
+    kind = monaco.languages.FoldingRangeKind.Comment;
+  } else if (range.kind === "imports") {
+    kind = monaco.languages.FoldingRangeKind.Imports;
+  } else if (range.kind === "region") {
+    kind = monaco.languages.FoldingRangeKind.Region;
+  }
+  return {
+    start: range.startLine + 1,
+    end: range.endLine + 1,
+    kind,
+  };
+}
 
 function toMonacoRange(range: Range): monaco.Range {
   return new monaco.Range(
@@ -164,12 +227,39 @@ function App() {
   const [dirs, setDirs] = useState<Record<string, FileEntry[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [currentPath, setCurrentPath] = useState<string | null>(null);
+  const [openTabs, setOpenTabs] = useState<string[]>([]);
   const [dirtyPaths, setDirtyPaths] = useState<Set<string>>(new Set());
   const [output, setOutput] = useState("// DevCpp++ P0\n// 打开一个文件夹，然后点击 .cpp 文件开始。");
+  const [stdinText, setStdinText] = useState("");
   const [problems, setProblems] = useState<ProblemItem[]>([]);
   const [status, setStatus] = useState("就绪");
   const [lspStatus, setLspStatus] = useState("LSP 未连接");
   const [toolchain, setToolchain] = useState<ToolchainInfo | null>(null);
+  const [recent, setRecent] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem("devcpp.recent");
+      return raw ? (JSON.parse(raw) as string[]) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const rememberRecent = useCallback((path: string) => {
+    setRecent((previous) => {
+      const next = [
+        path,
+        ...previous.filter(
+          (item) => normalizePath(item) !== normalizePath(path),
+        ),
+      ].slice(0, 8);
+      try {
+        localStorage.setItem("devcpp.recent", JSON.stringify(next));
+      } catch {
+        // ignore storage failures
+      }
+      return next;
+    });
+  }, []);
 
   const ensureDocumentByPath = useCallback(
     async (path: string): Promise<OpenedDoc | null> => {
@@ -218,9 +308,56 @@ function App() {
       if (!doc) return;
       editorRef.current?.setModel(doc.model);
       setCurrentPath(path);
+      setOpenTabs((previous) =>
+        previous.some((tab) => normalizePath(tab) === normalizePath(path))
+          ? previous
+          : [...previous, path],
+      );
       setStatus(`打开 ${path}`);
     },
     [ensureDocumentByPath],
+  );
+
+  const closeTab = useCallback(
+    (path: string) => {
+      const key = normalizePath(path);
+      if (
+        dirtyPaths.has(key) &&
+        !window.confirm("文件未保存，确定关闭？")
+      ) {
+        return;
+      }
+      const nextTabs = openTabs.filter(
+        (tab) => normalizePath(tab) !== key,
+      );
+      const closingCurrent =
+        currentPath !== null && normalizePath(currentPath) === key;
+      const fallback = closingCurrent
+        ? nextTabs[nextTabs.length - 1] ?? null
+        : null;
+      const fallbackDoc = fallback
+        ? docsRef.current.get(normalizePath(fallback))
+        : null;
+
+      if (closingCurrent) {
+        editorRef.current?.setModel(fallbackDoc?.model ?? null);
+        setCurrentPath(fallback);
+      }
+
+      const doc = docsRef.current.get(key);
+      if (doc) {
+        lspRef.current?.didClose(doc.uri);
+        doc.model.dispose();
+        docsRef.current.delete(key);
+      }
+      setOpenTabs(nextTabs);
+      setDirtyPaths((previous) => {
+        const next = new Set(previous);
+        next.delete(key);
+        return next;
+      });
+    },
+    [currentPath, dirtyPaths, openTabs],
   );
 
   const handleDiagnostics = useCallback(
@@ -406,11 +543,99 @@ function App() {
       },
     });
 
+    const references = monaco.languages.registerReferenceProvider("cpp", {
+      provideReferences: async (model, position, context) => {
+        const lsp = lspRef.current;
+        if (!lsp) return [];
+        try {
+          const locations = await lsp.references(
+            model.uri.toString(),
+            position.lineNumber - 1,
+            position.column - 1,
+            context.includeDeclaration,
+          );
+          const resolved: monaco.languages.Location[] = [];
+          for (const location of locations) {
+            const path = uriToPath(location.uri);
+            await ensureDocumentByPath(path);
+            resolved.push({
+              uri: monaco.Uri.file(path),
+              range: toMonacoRange(location.range),
+            });
+          }
+          return resolved;
+        } catch (error) {
+          console.warn("[lsp] references failed", error);
+          return [];
+        }
+      },
+    });
+
+    const formatting =
+      monaco.languages.registerDocumentFormattingEditProvider("cpp", {
+        provideDocumentFormattingEdits: async (model, options) => {
+          const lsp = lspRef.current;
+          if (!lsp) return [];
+          try {
+            const edits = await lsp.formatting(
+              model.uri.toString(),
+              options.tabSize,
+              options.insertSpaces,
+            );
+            return edits.map((edit) => ({
+              range: toMonacoRange(edit.range),
+              text: edit.newText,
+            }));
+          } catch (error) {
+            console.warn("[lsp] formatting failed", error);
+            return [];
+          }
+        },
+      });
+
+    const documentSymbols =
+      monaco.languages.registerDocumentSymbolProvider("cpp", {
+        provideDocumentSymbols: async (model) => {
+          const lsp = lspRef.current;
+          if (!lsp) return [];
+          try {
+            const symbols = await lsp.documentSymbols(
+              model.uri.toString(),
+            );
+            return symbols.map(toMonacoSymbol);
+          } catch (error) {
+            console.warn("[lsp] document symbols failed", error);
+            return [];
+          }
+        },
+      });
+
+    const foldingRanges = monaco.languages.registerFoldingRangeProvider(
+      "cpp",
+      {
+        provideFoldingRanges: async (model) => {
+          const lsp = lspRef.current;
+          if (!lsp) return [];
+          try {
+            const ranges = await lsp.foldingRanges(model.uri.toString());
+            return ranges.map(toFoldingRange);
+          } catch (error) {
+            console.warn("[lsp] folding ranges failed", error);
+            return [];
+          }
+        },
+      },
+    );
+
     return () => {
       contentSubscription.dispose();
       completions.dispose();
       hovers.dispose();
       definitions.dispose();
+      references.dispose();
+      formatting.dispose();
+      documentSymbols.dispose();
+      foldingRanges.dispose();
       editor.dispose();
       editorRef.current = null;
     };
@@ -450,6 +675,14 @@ function App() {
     }
   }, [currentPath]);
 
+  const formatCurrent = useCallback(async () => {
+    if (!currentPath) return;
+    await editorRef.current
+      ?.getAction("editor.action.formatDocument")
+      ?.run();
+    setStatus("已格式化");
+  }, [currentPath]);
+
   const buildAndRun = useCallback(async () => {
     if (!root || !currentPath) return;
     const saved = await saveCurrent();
@@ -460,6 +693,7 @@ function App() {
       const result = await invoke<BuildResult>("build_and_run", {
         root,
         file: currentPath,
+        stdin: stdinText,
       });
       setOutput(result.output || "(无输出)");
       setStatus(
@@ -471,7 +705,7 @@ function App() {
       setOutput(String(error));
       setStatus("构建失败");
     }
-  }, [root, currentPath, saveCurrent]);
+  }, [root, currentPath, saveCurrent, stdinText]);
 
   useEffect(() => {
     const element = outputRef.current;
@@ -491,10 +725,18 @@ function App() {
         event.preventDefault();
         void saveCurrent();
       }
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        event.key.toLowerCase() === "w" &&
+        currentPath
+      ) {
+        event.preventDefault();
+        closeTab(currentPath);
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [buildAndRun, saveCurrent]);
+  }, [buildAndRun, saveCurrent, currentPath, closeTab]);
 
   const openWorkspace = useCallback(
     async (selected: string) => {
@@ -510,7 +752,9 @@ function App() {
       }
 
       setRoot(selected);
+      rememberRecent(selected);
       setCurrentPath(null);
+      setOpenTabs([]);
       setDirtyPaths(new Set());
       setProblems([]);
       setDirs({});
@@ -559,7 +803,7 @@ function App() {
         setOutput(String(error));
       }
     },
-    [handleDiagnostics, openFile],
+    [handleDiagnostics, openFile, rememberRecent],
   );
 
   const openFolder = useCallback(async () => {
@@ -645,8 +889,6 @@ function App() {
     });
 
   const problemCount = problems.length;
-  const isDirty =
-    currentPath !== null && dirtyPaths.has(normalizePath(currentPath));
 
   return (
     <div className="app">
@@ -666,6 +908,13 @@ function App() {
           onClick={() => void saveCurrent()}
         >
           保存
+        </button>
+        <button
+          type="button"
+          disabled={!currentPath}
+          onClick={() => void formatCurrent()}
+        >
+          格式化
         </button>
         <button
           type="button"
@@ -694,20 +943,63 @@ function App() {
                 <div className="empty">没有文件</div>
               )
             ) : (
-              <div className="empty">打开一个 C++ 项目文件夹</div>
+              <div className="empty">
+                <div>打开一个 C++ 项目文件夹</div>
+                {recent.length > 0 ? (
+                  <div className="recent">
+                    <div className="recent-title">最近</div>
+                    {recent.map((path) => (
+                      <button
+                        key={path}
+                        type="button"
+                        className="recent-row"
+                        title={path}
+                        onClick={() => void openWorkspace(path)}
+                      >
+                        {path}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
             )}
           </div>
         </aside>
 
         <main className="editor-pane">
           <div className="tabbar">
-            {currentPath ? (
-              <span className="tab">
-                {currentPath.split(/[\\/]/).pop()}
-                {isDirty ? " •" : ""}
-              </span>
-            ) : (
+            {openTabs.length === 0 ? (
               <span className="tab muted">未打开文件</span>
+            ) : (
+              openTabs.map((path) => {
+                const active =
+                  currentPath !== null &&
+                  normalizePath(currentPath) === normalizePath(path);
+                const dirty = dirtyPaths.has(normalizePath(path));
+                return (
+                  <span
+                    key={path}
+                    className={`tab${active ? " active" : ""}`}
+                    onClick={() => void openFile(path)}
+                  >
+                    <span className="tab-label">
+                      {path.split(/[\\/]/).pop()}
+                      {dirty ? " •" : ""}
+                    </span>
+                    <button
+                      type="button"
+                      className="tab-close"
+                      title="关闭"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        closeTab(path);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </span>
+                );
+              })
             )}
           </div>
           <div className="editor-host" ref={editorHostRef} />
@@ -742,7 +1034,7 @@ function App() {
                   </span>
                   <span className="problem-message">{problem.message}</span>
                   <span className="problem-loc">
-                    {problem.path.split(/[\\/]/).pop()}:{problem.line}:
+                      {problem.path.split(/[\\/]/).pop()}:{problem.line}:
                     {problem.character}
                   </span>
                 </button>
@@ -755,6 +1047,13 @@ function App() {
           <pre className="output" ref={outputRef}>
             {output}
           </pre>
+          <textarea
+            className="stdin-input"
+            value={stdinText}
+            onChange={(event) => setStdinText(event.target.value)}
+            placeholder="标准输入（可选）：程序运行前写入 stdin，例如 21"
+            spellCheck={false}
+          />
         </div>
       </section>
 
