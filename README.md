@@ -52,6 +52,17 @@ npm run tauri build -- --debug --no-bundle
 .\src-tauri\target\debug\devcpp-plus-plus.exe
 ```
 
+发布安装包（NSIS）：
+
+```powershell
+npm run tauri build -- --bundles nsis
+# 产物：src-tauri\target\release\bundle\nsis\DevCpp++_0.1.0_x64-setup.exe
+```
+
+P0 实测：安装包约 **4.45 MiB**，应用 exe 约 **7.8 MiB**。
+安装包不包含 clangd / CMake / Ninja（保持轻量）；最终用户需安装 LLVM/CMake/Ninja，
+或把 `tools/` 放到应用目录旁。首次运行下载/内置工具包属于 P1。
+
 ## 验证
 
 ```powershell
@@ -66,7 +77,6 @@ Rust 测试覆盖：
 - stdin 转发
 - CMake 配置 / 构建 / 运行
 - clangd LSP initialize / diagnostics / completion / formatting / symbols
-- CMake 配置 / 构建 / 运行
 
 ## 快捷键
 

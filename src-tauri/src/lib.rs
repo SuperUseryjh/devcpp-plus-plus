@@ -1164,6 +1164,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_and_run_example() {
+        if find_gxx().is_none() {
+            eprintln!("skipping build test: g++ not found");
+            return;
+        }
         let root = example_root();
         let file = root.join("main.cpp");
         let result = build_and_run(
@@ -1185,6 +1189,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_and_run_in_chinese_path() {
+        if find_gxx().is_none() {
+            eprintln!("skipping chinese path test: g++ not found");
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "devcpp-测试-{}",
             Uuid::new_v4().simple()
@@ -1215,6 +1223,10 @@ mod tests {
 
     #[tokio::test]
     async fn build_and_run_with_stdin() {
+        if find_gxx().is_none() {
+            eprintln!("skipping stdin test: g++ not found");
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "devcpp-stdin-{}",
             Uuid::new_v4().simple()
@@ -1254,8 +1266,8 @@ int main() {
 
     #[tokio::test]
     async fn build_and_run_cmake_example() {
-        if find_cmake().is_none() || find_ninja().is_none() {
-            eprintln!("skipping CMake test: cmake/ninja not found");
+        if find_gxx().is_none() || find_cmake().is_none() || find_ninja().is_none() {
+            eprintln!("skipping CMake test: g++/cmake/ninja not found");
             return;
         }
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1291,6 +1303,10 @@ int main() {
 
     #[tokio::test]
     async fn lsp_bridge_initializes_and_publishes_diagnostics() {
+        if find_clangd().is_none() || find_gxx().is_none() {
+            eprintln!("skipping LSP test: clangd/g++ not found");
+            return;
+        }
         let root = example_root();
         let (info, handle) = start_lsp_session(&root, None)
             .await

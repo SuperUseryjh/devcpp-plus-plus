@@ -1493,7 +1493,8 @@ base-uri 'self';
 - 多标签页、格式化、引用、文档符号、折叠、最近工作区、stdin 文本框已接入；
 - 中文临时路径构建测试通过（构建目录回退到 ASCII）；
 - `cargo test` 5 项通过（含 stdin、中文路径、CMake）；`npm run build` 成功；
-- 应用退出后 clangd 无残留。
+- 应用退出后 clangd 无残留；
+- NSIS 发布包 4.45 MiB（exe 7.8 MiB），满足 ≤ 25 MB 目标。
 
 详细记录见 [`docs/P0_REPORT.md`](./docs/P0_REPORT.md)。
 
