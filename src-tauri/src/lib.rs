@@ -1106,9 +1106,45 @@ async fn run_program(
         .map_err(|e| format!("等待程序结束失败: {}", e))
 }
 
+pub fn run_external_runner(args: &[String]) -> i32 {
+    #[cfg(windows)]
+    unsafe {
+        if windows::Win32::System::Console::GetConsoleWindow().0.is_null() {
+            let _ = windows::Win32::System::Console::AllocConsole();
+        }
+    }
+    let Some(program) = args.first() else {
+        return 1;
+    };
+    let mut command = std::process::Command::new(program);
+    if let Some(cwd) = args.get(1) {
+        command.current_dir(cwd);
+    }
+    command
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    let code = command
+        .status()
+        .map(|status| status.code().unwrap_or(1))
+        .unwrap_or(1);
+    println!("
+程序已退出，按回车关闭窗口...");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    code
+}
+
 async fn run_program_external(exe: &Path, root: &Path, gxx: &Path) -> Result<Output, String> {
-    let mut run = TokioCommand::new(exe);
+    let helper = std::env::current_exe()
+        .map_err(|e| format!("定位 DevCpp++ 运行器失败: {}", e))?;
+    let mut run = TokioCommand::new(helper);
     run.current_dir(root)
+        .arg("--external-runner")
+        .arg(exe)
+        .arg(root)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
