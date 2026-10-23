@@ -1963,12 +1963,66 @@ async fn write_lsp(stdin: &mut ChildStdin, body: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn apply_window_chrome(window: &tauri::WebviewWindow) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_ROUND,
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let corner = DWMWCP_ROUND;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const _ as *const std::ffi::c_void,
+            std::mem::size_of_val(&corner) as u32,
+        )
+    };
+    let border: u32 = 0xFFFF_FFFE;
+    let _ = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border as *const _ as *const std::ffi::c_void,
+            4,
+        )
+    };
+}
+
+#[tauri::command]
+fn apply_window_chrome_command(app: AppHandle) {
+    #[cfg(windows)]
+    if let Some(window) = app.get_webview_window("main") {
+        apply_window_chrome(&window);
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // The HWND is not fully realized during setup; re-apply DWM
+                // attributes during the first second until the window is shown.
+                for _ in 0..5 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if let Some(window) = handle.get_webview_window("main") {
+                        #[cfg(windows)]
+                        apply_window_chrome(&window);
+                    }
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             open_workspace,
             list_dir,
@@ -1991,7 +2045,8 @@ pub fn run() {
             stop_lsp,
             build_and_run,
             build_and_run_stream,
-            cancel_build
+            cancel_build,
+            apply_window_chrome_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

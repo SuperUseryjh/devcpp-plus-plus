@@ -75,6 +75,7 @@ import "./App.css";
 interface OpenedDoc {
   path: string;
   uri: string;
+  version: number;
   model: monaco.editor.ITextModel;
   encoding: string;
   eol: string;
@@ -398,6 +399,7 @@ function App() {
   const openTabsRef = useRef<string[]>([]);
   const dirsRef = useRef<Record<string, FileEntry[]>>({});
   const dirtyPathsRef = useRef<Set<string>>(new Set());
+  const externalReloadRef = useRef<Set<string>>(new Set());
   const buildOutputBufferRef = useRef("");
   const buildOutputTimerRef = useRef<number | null>(null);
   const titlebarDragTimerRef = useRef<number | null>(null);
@@ -461,6 +463,10 @@ function App() {
   >([]);
   const [isMaximized, setIsMaximized] = useState(false);
   const [windowFocused, setWindowFocused] = useState(true);
+
+  useEffect(() => {
+    void invoke("apply_window_chrome_command").catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -613,6 +619,7 @@ function App() {
           encoding: data.encoding,
           eol: data.eol,
           language,
+          version: 1,
         };
         docsRef.current.set(key, doc);
         return doc;
@@ -906,7 +913,7 @@ function App() {
       });
     });
 
-    const contentSubscription = editor.onDidChangeModelContent((event) => {
+    const contentSubscription = editor.onDidChangeModelContent(() => {
       const model = editor.getModel();
       if (!model) return;
       const path = uriToPath(model.uri.toString());
@@ -914,32 +921,24 @@ function App() {
       const doc = docsRef.current.get(key);
       if (!doc) return;
 
-      setDirtyPaths((previous) => {
-        const next = new Set(previous);
-        next.add(key);
-        return next;
-      });
+      if (!externalReloadRef.current.has(key)) {
+        setDirtyPaths((previous) => {
+          const next = new Set(previous);
+          next.add(key);
+          return next;
+        });
+      }
 
       if (!isLspLanguage(doc.language)) return;
       const lsp = lspRef.current;
       if (!lsp) return;
-      lsp.didChange(
+      doc.version += 1;
+      // Full-document sync is used here deliberately: it is robust across
+      // multi-cursor edits, CRLF normalization and restart/re-open cycles.
+      lsp.didChangeFull(
         doc.uri,
-        model.getVersionId(),
-        event.changes.map((change) => ({
-          range: {
-            start: {
-              line: change.range.startLineNumber - 1,
-              character: change.range.startColumn - 1,
-            },
-            end: {
-              line: change.range.endLineNumber - 1,
-              character: change.range.endColumn - 1,
-            },
-          },
-          rangeLength: change.rangeLength,
-          text: change.text,
-        })),
+        doc.version,
+        model.getValue(monaco.editor.EndOfLinePreference.LF),
       );
     });
 
@@ -1396,6 +1395,7 @@ function App() {
                 return;
               }
               if (data.content !== doc.model.getValue()) {
+                externalReloadRef.current.add(key);
                 doc.model.setValue(data.content);
                 doc.model.setEOL(
                   data.eol === "crlf"
@@ -1404,6 +1404,7 @@ function App() {
                 );
                 doc.encoding = data.encoding;
                 doc.eol = data.eol;
+                queueMicrotask(() => externalReloadRef.current.delete(key));
                 setStatus(`已重新加载外部修改: ${event.payload.path}`);
               }
             })
@@ -1843,6 +1844,18 @@ function App() {
       const client = await LspClient.connect(info, workspaceRoot);
       client.onDiagnostics(handleDiagnostics);
       lspRef.current = client;
+      // A restarted clangd starts with no open documents. Replay the
+      // currently open buffers so diagnostics keep working after recovery.
+      for (const doc of docsRef.current.values()) {
+        if (isLspLanguage(doc.language)) {
+          doc.version = 1;
+          client.didOpen(
+            doc.uri,
+            doc.language,
+            doc.model.getValue(monaco.editor.EndOfLinePreference.LF),
+          );
+        }
+      }
       setLspStatus(
         `clangd ${shortVersion(
           clangdVersion ?? toolchain?.clangdVersion,

@@ -416,6 +416,13 @@ export class LspClient {
     });
   }
 
+  didChangeFull(uri: string, version: number, text: string): void {
+    void this.connection.sendNotification("textDocument/didChange", {
+      textDocument: { uri, version },
+      contentChanges: [{ text }],
+    });
+  }
+
   didClose(uri: string): void {
     void this.connection.sendNotification("textDocument/didClose", {
       textDocument: { uri },
