@@ -9,7 +9,9 @@
 
 ## 已实现（P0）
 
-- Tauri 桌面窗口 + React 布局 + Monaco C++ 编辑器
+- VS Code 风格布局：菜单栏、活动栏、资源管理器、标签页/面包屑、命令面板、底部面板、状态栏
+- Tauri 桌面窗口 + React + Monaco C++ 编辑器
+- CMakeLists.txt 使用独立 CMake 语法高亮，不会发送给 clangd 检查
 - 打开文件夹 / 文件树 / 多标签页 / 保存 / 最近工作区
 - 工作区扫描 + 自动生成 `.devcpp/compile_commands.json`
 - clangd 20.1.8 LSP over loopback WebSocket
@@ -86,6 +88,8 @@ Rust 测试覆盖：
 | `Ctrl+S` | 保存 |
 | `Ctrl+Space` | 触发补全（由 Monaco/clangd 提供） |
 | `Ctrl+W` | 关闭当前标签页 |
+| `Ctrl+Shift+P` / `Ctrl+P` | 命令面板 |
+| `Ctrl+B` / `Ctrl+J` | 切换侧边栏 / 底部面板 |
 | `Shift+Alt+F` | 格式化当前文件 |
 | `F12` | 跳转定义（Monaco 默认） |
 | `Shift+F12` | 查找引用 |

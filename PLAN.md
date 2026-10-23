@@ -1491,6 +1491,8 @@ base-uri 'self';
 - g++ 编译运行输出 `Hello from DevCpp++! total = 6`；
 - CMake 4.2.0 + Ninja 1.13.2 配置/构建/运行 `examples/cmake-hello` 成功；
 - 多标签页、格式化、引用、文档符号、折叠、最近工作区、stdin 文本框已接入；
+- 前端已按 VS Code 结构重做（菜单栏/活动栏/命令面板/面包屑/大纲/状态栏/底部面板）；
+- CMakeLists.txt 使用 CMake 语言，不再发送给 clangd 检查；
 - 中文临时路径构建测试通过（构建目录回退到 ASCII）；
 - `cargo test` 5 项通过（含 stdin、中文路径、CMake）；`npm run build` 成功；
 - 应用退出后 clangd 无残留；

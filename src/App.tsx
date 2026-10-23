@@ -8,7 +8,33 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  ChevronDown,
+  ChevronRight,
+  CircleAlert,
+  Command,
+  FileCode2,
+  FileText,
+  Files,
+  Folder,
+  FolderOpen,
+  Hammer,
+  PanelBottom,
+  Play,
+  RefreshCw,
+  Save,
+  Search,
+  Settings,
+  Terminal,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { monaco } from "./editor/monaco";
+import {
+  isLspLanguage,
+  languageForPath,
+  type EditorLanguage,
+} from "./editor/language";
 import {
   LspClient,
   normalizePath,
@@ -36,6 +62,7 @@ interface OpenedDoc {
   model: monaco.editor.ITextModel;
   encoding: string;
   eol: string;
+  language: EditorLanguage;
 }
 
 interface ProblemItem {
@@ -45,6 +72,66 @@ interface ProblemItem {
   severity: number;
   line: number;
   character: number;
+}
+
+type SidebarView = "explorer" | "search" | "problems" | "run" | "settings";
+type PanelTab = "problems" | "output";
+
+interface OutlineItem {
+  name: string;
+  detail?: string;
+  kind: number;
+  line: number;
+  character: number;
+  depth: number;
+}
+
+interface CommandItem {
+  id: string;
+  label: string;
+  keybinding?: string;
+  run: () => void;
+}
+
+function flattenSymbols(
+  symbols: DocumentSymbol[],
+  depth = 0,
+): OutlineItem[] {
+  return symbols.flatMap((symbol) => [
+    {
+      name: symbol.name,
+      detail: symbol.detail,
+      kind: symbol.kind,
+      line: symbol.selectionRange.start.line + 1,
+      character: symbol.selectionRange.start.character + 1,
+      depth,
+    },
+    ...(symbol.children ? flattenSymbols(symbol.children, depth + 1) : []),
+  ]);
+}
+
+function languageLabel(language: EditorLanguage): string {
+  switch (language) {
+    case "cpp":
+      return "C++";
+    case "c":
+      return "C";
+    case "cmake":
+      return "CMake";
+    default:
+      return "Plain Text";
+  }
+}
+
+function fileIcon(name: string): ReactNode {
+  const language = languageForPath(name);
+  if (language === "cpp" || language === "c") {
+    return <FileCode2 size={14} className="icon-cpp" />;
+  }
+  if (language === "cmake") {
+    return <FileText size={14} className="icon-cmake" />;
+  }
+  return <FileText size={14} className="icon-text" />;
 }
 
 const COMPLETION_KINDS: monaco.languages.CompletionItemKind[] = [
@@ -244,6 +331,17 @@ function App() {
     }
   });
 
+  const [sidebarView, setSidebarView] = useState<SidebarView>("explorer");
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+  const [panelVisible, setPanelVisible] = useState(true);
+  const [panelTab, setPanelTab] = useState<PanelTab>("problems");
+  const [cursor, setCursor] = useState({ line: 1, column: 1 });
+  const [outline, setOutline] = useState<OutlineItem[]>([]);
+  const [menuOpen, setMenuOpen] = useState<string | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [paletteIndex, setPaletteIndex] = useState(0);
+
   const rememberRecent = useCallback((path: string) => {
     setRecent((previous) => {
       const next = [
@@ -269,20 +367,23 @@ function App() {
 
       try {
         const data = await invoke<FileData>("read_text_file", { path });
+        const language = languageForPath(path);
         const uri = monaco.Uri.file(path);
         let model = monaco.editor.getModel(uri);
         if (!model) {
-          model = monaco.editor.createModel(data.content, "cpp", uri);
+          model = monaco.editor.createModel(data.content, language, uri);
           model.setEOL(
             data.eol === "crlf"
               ? monaco.editor.EndOfLineSequence.CRLF
               : monaco.editor.EndOfLineSequence.LF,
           );
-          lspRef.current?.didOpen(
-            model.uri.toString(),
-            "cpp",
-            model.getValue(monaco.editor.EndOfLinePreference.LF),
-          );
+          if (isLspLanguage(language)) {
+            lspRef.current?.didOpen(
+              model.uri.toString(),
+              language,
+              model.getValue(monaco.editor.EndOfLinePreference.LF),
+            );
+          }
         }
         const doc: OpenedDoc = {
           path,
@@ -290,6 +391,7 @@ function App() {
           model,
           encoding: data.encoding,
           eol: data.eol,
+          language,
         };
         docsRef.current.set(key, doc);
         return doc;
@@ -316,6 +418,21 @@ function App() {
       setStatus(`打开 ${path}`);
     },
     [ensureDocumentByPath],
+  );
+
+  const openProblem = useCallback(
+    async (problem: ProblemItem) => {
+      await openFile(problem.path);
+      editorRef.current?.setPosition({
+        lineNumber: problem.line,
+        column: problem.character,
+      });
+      editorRef.current?.revealPositionInCenter({
+        lineNumber: problem.line,
+        column: problem.character,
+      });
+    },
+    [openFile],
   );
 
   const closeTab = useCallback(
@@ -406,13 +523,26 @@ function App() {
       fontSize: 14,
       fontFamily:
         "Consolas, 'Cascadia Code', 'Microsoft YaHei', monospace",
-      minimap: { enabled: false },
+      minimap: { enabled: true, renderCharacters: false, maxColumn: 80 },
       automaticLayout: true,
       scrollBeyondLastLine: false,
       renderWhitespace: "selection",
+      renderLineHighlight: "all",
+      cursorBlinking: "smooth",
+      smoothScrolling: true,
+      stickyScroll: { enabled: true },
+      bracketPairColorization: { enabled: true },
+      guides: { indentation: true, bracketPairs: true },
       tabSize: 4,
     });
     editorRef.current = editor;
+
+    const cursorSubscription = editor.onDidChangeCursorPosition((event) => {
+      setCursor({
+        line: event.position.lineNumber,
+        column: event.position.column,
+      });
+    });
 
     const contentSubscription = editor.onDidChangeModelContent((event) => {
       const model = editor.getModel();
@@ -428,6 +558,7 @@ function App() {
         return next;
       });
 
+      if (!isLspLanguage(doc.language)) return;
       const lsp = lspRef.current;
       if (!lsp) return;
       lsp.didChange(
@@ -628,6 +759,7 @@ function App() {
     );
 
     return () => {
+      cursorSubscription.dispose();
       contentSubscription.dispose();
       completions.dispose();
       hovers.dispose();
@@ -649,6 +781,43 @@ function App() {
       void pending.then((unlisten) => unlisten());
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const doc = currentPath
+      ? docsRef.current.get(normalizePath(currentPath))
+      : undefined;
+    if (
+      !doc ||
+      !isLspLanguage(doc.language) ||
+      !lspRef.current
+    ) {
+      setOutline([]);
+      return;
+    }
+    void lspRef.current
+      .documentSymbols(doc.uri)
+      .then((symbols) => {
+        if (!cancelled) setOutline(flattenSymbols(symbols));
+      })
+      .catch(() => {
+        if (!cancelled) setOutline([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [currentPath, lspStatus]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeMenu = () => setMenuOpen(null);
+    window.addEventListener("pointerdown", closeMenu);
+    return () => window.removeEventListener("pointerdown", closeMenu);
+  }, [menuOpen]);
+
+  useEffect(() => {
+    setPaletteIndex(0);
+  }, [paletteQuery, paletteOpen]);
 
   const saveCurrent = useCallback(async (): Promise<boolean> => {
     if (!currentPath) return false;
@@ -714,22 +883,52 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      const ctrl = event.ctrlKey || event.metaKey;
+      const key = event.key.toLowerCase();
+      if (ctrl && event.shiftKey && key === "p") {
+        event.preventDefault();
+        setMenuOpen(null);
+        setPaletteOpen(true);
+        return;
+      }
+      if (ctrl && event.shiftKey && key === "m") {
+        event.preventDefault();
+        setSidebarView("problems");
+        setSidebarVisible(true);
+        setPanelTab("problems");
+        setPanelVisible(true);
+        return;
+      }
+      if (ctrl && key === "p" && !event.shiftKey) {
+        event.preventDefault();
+        setMenuOpen(null);
+        setPaletteOpen(true);
+        return;
+      }
+      if (ctrl && key === "b") {
+        event.preventDefault();
+        setSidebarVisible((visible) => !visible);
+        return;
+      }
+      if (ctrl && key === "j") {
+        event.preventDefault();
+        setPanelVisible((visible) => !visible);
+        return;
+      }
+      if (event.key === "Escape") {
+        setPaletteOpen(false);
+        setMenuOpen(null);
+        return;
+      }
       if (event.key === "F11") {
         event.preventDefault();
         void buildAndRun();
       }
-      if (
-        (event.ctrlKey || event.metaKey) &&
-        event.key.toLowerCase() === "s"
-      ) {
+      if (ctrl && key === "s") {
         event.preventDefault();
         void saveCurrent();
       }
-      if (
-        (event.ctrlKey || event.metaKey) &&
-        event.key.toLowerCase() === "w" &&
-        currentPath
-      ) {
+      if (ctrl && key === "w" && currentPath) {
         event.preventDefault();
         closeTab(currentPath);
       }
@@ -872,6 +1071,234 @@ function App() {
     [openExampleCommand],
   );
 
+  const refreshRoot = useCallback(async () => {
+    if (!root) return;
+    try {
+      setEntries(await invoke<FileEntry[]>("list_dir", { path: root }));
+      setDirs({});
+      setExpanded(new Set());
+    } catch (error) {
+      setOutput(String(error));
+    }
+  }, [root]);
+
+  const runEditorAction = useCallback((action: string) => {
+    editorRef.current?.trigger("menu", action, null);
+  }, []);
+
+  const showPanel = useCallback((tab: PanelTab) => {
+    setPanelTab(tab);
+    setPanelVisible(true);
+  }, []);
+
+  const selectView = useCallback(
+    (view: SidebarView) => {
+      if (sidebarView === view && sidebarVisible) {
+        setSidebarVisible(false);
+        return;
+      }
+      setSidebarView(view);
+      setSidebarVisible(true);
+    },
+    [sidebarView, sidebarVisible],
+  );
+
+  const showView = useCallback((view: SidebarView) => {
+    setSidebarView(view);
+    setSidebarVisible(true);
+  }, []);
+
+  const about = useCallback(() => {
+    setOutput(
+      [
+        "DevCpp++ 0.1.0 (P0)",
+        "",
+        "Tauri 2 + React + Monaco Editor + clangd + GCC",
+        "计划书: PLAN.md",
+        "P0 报告: docs/P0_REPORT.md",
+      ].join("\n"),
+    );
+    showPanel("output");
+  }, [showPanel]);
+
+  const commands: CommandItem[] = [
+    {
+      id: "file.openFolder",
+      label: "文件: 打开文件夹...",
+      run: () => void openFolder(),
+    },
+    {
+      id: "file.openExample",
+      label: "文件: 打开示例项目",
+      run: () => void openExample(),
+    },
+    {
+      id: "file.openCmakeExample",
+      label: "文件: 打开 CMake 示例项目",
+      run: () => void openCmakeExample(),
+    },
+    {
+      id: "file.save",
+      label: "文件: 保存",
+      keybinding: "Ctrl+S",
+      run: () => void saveCurrent(),
+    },
+    {
+      id: "file.close",
+      label: "文件: 关闭编辑器",
+      keybinding: "Ctrl+W",
+      run: () => {
+        if (currentPath) closeTab(currentPath);
+      },
+    },
+    {
+      id: "edit.undo",
+      label: "编辑: 撤销",
+      keybinding: "Ctrl+Z",
+      run: () => runEditorAction("undo"),
+    },
+    {
+      id: "edit.redo",
+      label: "编辑: 重做",
+      keybinding: "Ctrl+Y",
+      run: () => runEditorAction("redo"),
+    },
+    {
+      id: "edit.find",
+      label: "编辑: 查找",
+      keybinding: "Ctrl+F",
+      run: () => runEditorAction("actions.find"),
+    },
+    {
+      id: "edit.replace",
+      label: "编辑: 替换",
+      keybinding: "Ctrl+H",
+      run: () => runEditorAction("editor.action.startFindReplaceAction"),
+    },
+    {
+      id: "view.explorer",
+      label: "查看: 资源管理器",
+      keybinding: "Ctrl+B",
+      run: () => showView("explorer"),
+    },
+    {
+      id: "view.search",
+      label: "查看: 搜索",
+      run: () => showView("search"),
+    },
+    {
+      id: "view.problems",
+      label: "查看: 问题",
+      keybinding: "Ctrl+Shift+M",
+      run: () => {
+        showView("problems");
+        showPanel("problems");
+      },
+    },
+    {
+      id: "view.output",
+      label: "查看: 输出",
+      run: () => showPanel("output"),
+    },
+    {
+      id: "view.palette",
+      label: "查看: 命令面板",
+      keybinding: "Ctrl+Shift+P",
+      run: () => setPaletteOpen(true),
+    },
+    {
+      id: "view.toggleSidebar",
+      label: "查看: 切换侧边栏",
+      keybinding: "Ctrl+B",
+      run: () => setSidebarVisible((visible) => !visible),
+    },
+    {
+      id: "view.togglePanel",
+      label: "查看: 切换底部面板",
+      keybinding: "Ctrl+J",
+      run: () => setPanelVisible((visible) => !visible),
+    },
+    {
+      id: "run.build",
+      label: "运行: 编译并运行",
+      keybinding: "F11",
+      run: () => void buildAndRun(),
+    },
+    {
+      id: "run.format",
+      label: "运行: 格式化当前文件",
+      keybinding: "Shift+Alt+F",
+      run: () => void formatCurrent(),
+    },
+    {
+      id: "help.about",
+      label: "帮助: 关于 DevCpp++",
+      run: about,
+    },
+  ];
+
+  const menuDefs: Array<{
+    id: string;
+    label: string;
+    items: string[];
+  }> = [
+    {
+      id: "file",
+      label: "文件",
+      items: [
+        "file.openFolder",
+        "file.openExample",
+        "file.openCmakeExample",
+        "file.save",
+        "file.close",
+      ],
+    },
+    {
+      id: "edit",
+      label: "编辑",
+      items: ["edit.undo", "edit.redo", "edit.find", "edit.replace"],
+    },
+    {
+      id: "view",
+      label: "查看",
+      items: [
+        "view.explorer",
+        "view.search",
+        "view.problems",
+        "view.output",
+        "view.palette",
+        "view.toggleSidebar",
+        "view.togglePanel",
+      ],
+    },
+    {
+      id: "run",
+      label: "运行",
+      items: ["run.build", "run.format"],
+    },
+    {
+      id: "help",
+      label: "帮助",
+      items: ["help.about"],
+    },
+  ];
+
+  const runCommand = useCallback(
+    (id: string) => {
+      setMenuOpen(null);
+      setPaletteOpen(false);
+      commands.find((command) => command.id === id)?.run();
+    },
+    [commands],
+  );
+
+  const normalizedPaletteQuery = paletteQuery.trim().toLowerCase();
+  const filteredCommands = normalizedPaletteQuery
+    ? commands.filter((command) =>
+        command.label.toLowerCase().includes(normalizedPaletteQuery),
+      )
+    : commands;
+
   useEffect(() => {
     if (!import.meta.env.DEV || autoOpenedRef.current) return;
     autoOpenedRef.current = true;
@@ -907,80 +1334,229 @@ function App() {
       const isActive =
         currentPath !== null &&
         normalizePath(currentPath) === normalizePath(item.path);
+      const isOpen = expanded.has(item.path);
       return (
         <div key={item.path}>
           <button
             type="button"
             className={`tree-row${isActive ? " active" : ""}`}
             style={{ paddingLeft: 8 + depth * 14 }}
+            title={item.path}
             onClick={() =>
               item.isDir ? void toggleDir(item.path) : void openFile(item.path)
             }
           >
             <span className="tree-caret">
-              {item.isDir ? (expanded.has(item.path) ? "▾" : "▸") : ""}
+              {item.isDir ? (
+                isOpen ? (
+                  <ChevronDown size={14} />
+                ) : (
+                  <ChevronRight size={14} />
+                )
+              ) : null}
+            </span>
+            <span className="tree-icon">
+              {item.isDir ? (
+                isOpen ? (
+                  <FolderOpen size={14} className="icon-folder" />
+                ) : (
+                  <Folder size={14} className="icon-folder" />
+                )
+              ) : (
+                fileIcon(item.name)
+              )}
             </span>
             <span className="tree-name">{item.name}</span>
           </button>
-          {item.isDir &&
-          expanded.has(item.path) &&
-          dirs[item.path] ? (
+          {item.isDir && isOpen && dirs[item.path] ? (
             <div>{renderTree(dirs[item.path], depth + 1)}</div>
           ) : null}
         </div>
       );
     });
 
-  const problemCount = problems.length;
+  const renderProblemList = (): ReactNode =>
+    problems.length === 0 ? (
+      <div className="empty">暂无问题</div>
+    ) : (
+      problems.map((problem) => (
+        <button
+          key={`${problem.uri}:${problem.line}:${problem.character}:${problem.message}`}
+          type="button"
+          className="problem-row"
+          onClick={() => void openProblem(problem)}
+        >
+          {problem.severity === 2 ? (
+            <TriangleAlert size={14} className="icon-warning" />
+          ) : (
+            <CircleAlert size={14} className="icon-error" />
+          )}
+          <span className="problem-message">{problem.message}</span>
+          <span className="problem-loc">
+            {problem.path.split(/[\\/]/).pop()}:{problem.line}:
+            {problem.character}
+          </span>
+        </button>
+      ))
+    );
 
-  return (
-    <div className="app">
-      <header className="toolbar">
-        <div className="brand">
-          DevCpp++ <span className="badge">P0</span>
+  const renderSidebar = (): ReactNode => {
+    if (sidebarView === "search") {
+      return (
+        <>
+          <div className="sidebar-header">
+            <span>搜索</span>
+          </div>
+          <div className="sidebar-body">
+            <input
+              className="search-input"
+              placeholder="搜索（P1 接入）"
+              disabled
+            />
+            <div className="empty">工作区搜索将在 P1 接入。</div>
+          </div>
+        </>
+      );
+    }
+    if (sidebarView === "problems") {
+      return (
+        <>
+          <div className="sidebar-header">
+            <span>问题</span>
+            <span className="sidebar-count">{problemCount}</span>
+          </div>
+          <div className="sidebar-body">{renderProblemList()}</div>
+        </>
+      );
+    }
+    if (sidebarView === "run") {
+      return (
+        <>
+          <div className="sidebar-header">
+            <span>运行和调试</span>
+          </div>
+          <div className="sidebar-body run-view">
+            <button
+              type="button"
+              className="side-button primary"
+              disabled={!currentPath}
+              onClick={() => void buildAndRun()}
+            >
+              <Play size={15} /> 编译并运行
+              <kbd>F11</kbd>
+            </button>
+            <button
+              type="button"
+              className="side-button"
+              disabled={!currentPath}
+              onClick={() => void saveCurrent()}
+            >
+              <Save size={15} /> 保存
+            </button>
+            <button
+              type="button"
+              className="side-button"
+              disabled={!currentPath}
+              onClick={() => void formatCurrent()}
+            >
+              <Hammer size={15} /> 格式化
+            </button>
+            <label className="field-label" htmlFor="run-stdin">
+              标准输入
+            </label>
+            <textarea
+              id="run-stdin"
+              className="side-stdin"
+              value={stdinText}
+              onChange={(event) => setStdinText(event.target.value)}
+              placeholder="程序运行前写入 stdin"
+              spellCheck={false}
+            />
+            <div className="side-meta">
+              {currentPath
+                ? currentPath.split(/[\\/]/).pop()
+                : "未打开文件"}
+            </div>
+            <div className="side-note">
+              调试器尚未接入；当前支持编译运行与 stdin。
+            </div>
+          </div>
+        </>
+      );
+    }
+    if (sidebarView === "settings") {
+      const rows: Array<[string, string | undefined]> = [
+        ["g++", toolchain?.gxx],
+        ["gdb", toolchain?.gdb],
+        ["clangd", toolchain?.clangd],
+        ["CMake", toolchain?.cmake],
+        ["Ninja", toolchain?.ninja],
+      ];
+      return (
+        <>
+          <div className="sidebar-header">
+            <span>设置</span>
+          </div>
+          <div className="sidebar-body settings-view">
+            <div className="settings-title">工具链</div>
+            {rows.map(([label, value]) => (
+              <div className="setting-row" key={label}>
+                <span className="setting-label">{label}</span>
+                <span className="setting-value" title={value}>
+                  {value ?? "未检测到"}
+                </span>
+              </div>
+            ))}
+            <div className="side-note">
+              运行 <code>scripts/fetch-toolchain.ps1</code> 下载
+              clangd/CMake/Ninja，或设置 DEVCPP_* 环境变量。
+            </div>
+            <div className="settings-title">快捷键</div>
+            <div className="setting-row">
+              <span className="setting-label">命令面板</span>
+              <span className="setting-value">Ctrl+Shift+P</span>
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">编译运行</span>
+              <span className="setting-value">F11</span>
+            </div>
+            <div className="setting-row">
+              <span className="setting-label">格式化</span>
+              <span className="setting-value">Shift+Alt+F</span>
+            </div>
+          </div>
+        </>
+      );
+    }
+    return (
+      <>
+        <div className="sidebar-header">
+          <span>资源管理器</span>
+          <div className="sidebar-actions">
+            <button
+              type="button"
+              className="icon-button"
+              title="打开文件夹"
+              onClick={() => void openFolder()}
+            >
+              <FolderOpen size={15} />
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              title="刷新"
+              onClick={() => void refreshRoot()}
+            >
+              <RefreshCw size={15} />
+            </button>
+          </div>
         </div>
-        <button type="button" onClick={() => void openFolder()}>
-          打开文件夹
-        </button>
-        <button type="button" onClick={() => void openExample()}>
-          打开示例
-        </button>
-        <button type="button" onClick={() => void openCmakeExample()}>
-          CMake 示例
-        </button>
-        <button
-          type="button"
-          disabled={!currentPath}
-          onClick={() => void saveCurrent()}
-        >
-          保存
-        </button>
-        <button
-          type="button"
-          disabled={!currentPath}
-          onClick={() => void formatCurrent()}
-        >
-          格式化
-        </button>
-        <button
-          type="button"
-          className="primary"
-          disabled={!currentPath}
-          onClick={() => void buildAndRun()}
-        >
-          编译运行 F11
-        </button>
-        <div className="toolbar-spacer" />
-        <span className={`lsp-pill ${lspStatus.includes("不可用") ? "bad" : ""}`}>
-          {lspStatus}
-        </span>
-        <span className="status-text">{status}</span>
-      </header>
-
-      <div className="workspace">
-        <aside className="sidebar">
-          <div className="panel-title">资源管理器</div>
-          {root ? <div className="root-path">{root}</div> : null}
+        <div className="sidebar-body">
+          {root ? (
+            <div className="root-path" title={root}>
+              {root}
+            </div>
+          ) : null}
           <div className="tree">
             {root ? (
               entries.length > 0 ? (
@@ -989,49 +1565,212 @@ function App() {
                 <div className="empty">没有文件</div>
               )
             ) : (
-              <div className="empty">
-                <div>打开一个 C++ 项目文件夹</div>
-                {recent.length > 0 ? (
-                  <div className="recent">
-                    <div className="recent-title">最近</div>
-                    {recent.map((path) => (
-                      <button
-                        key={path}
-                        type="button"
-                        className="recent-row"
-                        title={path}
-                        onClick={() => void openWorkspace(path)}
-                      >
-                        {path}
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
+              <div className="empty">打开一个 C++ 项目文件夹</div>
             )}
           </div>
-        </aside>
+          {root && outline.length > 0 ? (
+            <>
+              <div className="section-title">大纲</div>
+              <div className="outline">
+                {outline.map((item, index) => (
+                  <button
+                    type="button"
+                    key={`${item.name}:${item.line}:${index}`}
+                    className="outline-item"
+                    style={{ paddingLeft: 10 + item.depth * 14 }}
+                    onClick={() => {
+                      editorRef.current?.setPosition({
+                        lineNumber: item.line,
+                        column: item.character,
+                      });
+                      editorRef.current?.revealPositionInCenter({
+                        lineNumber: item.line,
+                        column: item.character,
+                      });
+                    }}
+                  >
+                    <span className="outline-kind">●</span>
+                    <span className="outline-name">{item.name}</span>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : null}
+        </div>
+      </>
+    );
+  };
 
-        <main className="editor-pane">
+  const problemCount = problems.length;
+  const errorCount = problems.filter((problem) => problem.severity === 1).length;
+  const warningCount = problemCount - errorCount;
+  const activeDoc = currentPath
+    ? docsRef.current.get(normalizePath(currentPath))
+    : undefined;
+  const activeLanguage = currentPath
+    ? languageForPath(currentPath)
+    : ("plaintext" as EditorLanguage);
+  const activeEncoding = activeDoc?.encoding.toUpperCase() ?? "UTF-8";
+  const activeEol = activeDoc?.eol === "crlf" ? "CRLF" : "LF";
+  let breadcrumbPath = currentPath ?? "";
+  if (
+    root &&
+    breadcrumbPath.toLowerCase().startsWith(root.toLowerCase())
+  ) {
+    breadcrumbPath = breadcrumbPath.slice(root.length);
+  }
+  const breadcrumbParts = breadcrumbPath
+    .split(/[\\/]/)
+    .filter(Boolean);
+
+  return (
+    <div className="app">
+      <div
+        className="menubar"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="menu-group">
+          {menuDefs.map((menu) => (
+            <div className="menu" key={menu.id}>
+              <button
+                type="button"
+                className={`menu-button${
+                  menuOpen === menu.id ? " active" : ""
+                }`}
+                onClick={() =>
+                  setMenuOpen(menuOpen === menu.id ? null : menu.id)
+                }
+              >
+                {menu.label}
+              </button>
+              {menuOpen === menu.id ? (
+                <div className="menu-dropdown">
+                  {menu.items.map((id) => {
+                    const command = commands.find((item) => item.id === id);
+                    if (!command) return null;
+                    return (
+                      <button
+                        type="button"
+                        className="menu-item"
+                        key={id}
+                        onClick={() => runCommand(id)}
+                      >
+                        <span>
+                          {command.label.replace(/^[^:]+:\s*/, "")}
+                        </span>
+                        {command.keybinding ? (
+                          <span className="menu-shortcut">
+                            {command.keybinding}
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          className="command-center"
+          onClick={() => {
+            setMenuOpen(null);
+            setPaletteOpen(true);
+          }}
+        >
+          <Search size={13} />
+          <span>搜索或运行命令</span>
+          <span className="command-center-hint">Ctrl+Shift+P</span>
+        </button>
+        <div className="menubar-right">
+          <span className="p0-badge">P0</span>
+        </div>
+      </div>
+
+      <div className="main">
+        <nav className="activitybar">
+          <button
+            type="button"
+            className={`activity-item${
+              sidebarView === "explorer" && sidebarVisible ? " active" : ""
+            }`}
+            title="资源管理器"
+            onClick={() => selectView("explorer")}
+          >
+            <Files size={22} />
+          </button>
+          <button
+            type="button"
+            className={`activity-item${
+              sidebarView === "search" && sidebarVisible ? " active" : ""
+            }`}
+            title="搜索"
+            onClick={() => selectView("search")}
+          >
+            <Search size={22} />
+          </button>
+          <button
+            type="button"
+            className={`activity-item${
+              sidebarView === "problems" && sidebarVisible ? " active" : ""
+            }`}
+            title="问题"
+            onClick={() => selectView("problems")}
+          >
+            <CircleAlert size={22} />
+            {problemCount > 0 ? (
+              <span className="activity-badge">{problemCount}</span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            className={`activity-item${
+              sidebarView === "run" && sidebarVisible ? " active" : ""
+            }`}
+            title="运行和调试"
+            onClick={() => selectView("run")}
+          >
+            <Play size={22} />
+          </button>
+          <div className="activity-spacer" />
+          <button
+            type="button"
+            className={`activity-item${
+              sidebarView === "settings" && sidebarVisible ? " active" : ""
+            }`}
+            title="设置"
+            onClick={() => selectView("settings")}
+          >
+            <Settings size={22} />
+          </button>
+        </nav>
+
+        {sidebarVisible ? (
+          <aside className="sidebar">{renderSidebar()}</aside>
+        ) : null}
+
+        <section className="editor-group">
           <div className="tabbar">
             {openTabs.length === 0 ? (
-              <span className="tab muted">未打开文件</span>
+              <div className="tabbar-empty">无打开的编辑器</div>
             ) : (
               openTabs.map((path) => {
                 const active =
                   currentPath !== null &&
                   normalizePath(currentPath) === normalizePath(path);
                 const dirty = dirtyPaths.has(normalizePath(path));
+                const name = path.split(/[\\/]/).pop() ?? path;
                 return (
-                  <span
+                  <div
                     key={path}
                     className={`tab${active ? " active" : ""}`}
+                    title={path}
                     onClick={() => void openFile(path)}
                   >
-                    <span className="tab-label">
-                      {path.split(/[\\/]/).pop()}
-                      {dirty ? " •" : ""}
-                    </span>
+                    <span className="tab-icon">{fileIcon(name)}</span>
+                    <span className="tab-label">{name}</span>
+                    {dirty ? <span className="tab-dirty">●</span> : null}
                     <button
                       type="button"
                       className="tab-close"
@@ -1041,77 +1780,275 @@ function App() {
                         closeTab(path);
                       }}
                     >
-                      ×
+                      <X size={12} />
                     </button>
-                  </span>
+                  </div>
                 );
               })
             )}
+            <div className="tabbar-spacer" />
           </div>
-          <div className="editor-host" ref={editorHostRef} />
-        </main>
+
+          {breadcrumbParts.length > 0 ? (
+            <div className="breadcrumbs">
+              {breadcrumbParts.map((part, index) => (
+                <span className="breadcrumb" key={`${part}:${index}`}>
+                  {index > 0 ? <ChevronRight size={12} /> : null}
+                  {index === breadcrumbParts.length - 1 ? (
+                    fileIcon(part)
+                  ) : (
+                    <Folder size={13} />
+                  )}
+                  <span>{part}</span>
+                </span>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="editor-container">
+            <div className="editor-host" ref={editorHostRef} />
+            {openTabs.length === 0 ? (
+              <div className="welcome">
+                <div className="welcome-logo">DevCpp++</div>
+                <div className="welcome-subtitle">
+                  轻量、现代、Windows 优先的 C++ IDE
+                </div>
+                <div className="welcome-actions">
+                  <button
+                    type="button"
+                    className="welcome-button primary"
+                    onClick={() => void openFolder()}
+                  >
+                    <FolderOpen size={16} /> 打开文件夹
+                  </button>
+                  <button
+                    type="button"
+                    className="welcome-button"
+                    onClick={() => void openExample()}
+                  >
+                    <Play size={16} /> 打开示例
+                  </button>
+                  <button
+                    type="button"
+                    className="welcome-button"
+                    onClick={() => void openCmakeExample()}
+                  >
+                    <Hammer size={16} /> CMake 示例
+                  </button>
+                </div>
+                {recent.length > 0 ? (
+                  <div className="welcome-recent">
+                    <div className="welcome-recent-title">最近</div>
+                    {recent.map((path) => (
+                      <button
+                        type="button"
+                        className="welcome-recent-row"
+                        key={path}
+                        title={path}
+                        onClick={() => void openWorkspace(path)}
+                      >
+                        {path}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="welcome-hint">
+                  Ctrl+Shift+P 命令面板 · Ctrl+J 切换面板 · F11
+                  编译运行
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </section>
       </div>
 
-      <section className="bottom-panel">
-        <div className="bottom-column">
-          <div className="panel-title">
-            问题 <span className="count">{problemCount}</span>
+      {panelVisible ? (
+        <section className="panel">
+          <div className="panel-header">
+            <div className="panel-tabs">
+              <button
+                type="button"
+                className={`panel-tab${
+                  panelTab === "problems" ? " active" : ""
+                }`}
+                onClick={() => setPanelTab("problems")}
+              >
+                问题 <span className="badge">{problemCount}</span>
+              </button>
+              <button
+                type="button"
+                className={`panel-tab${
+                  panelTab === "output" ? " active" : ""
+                }`}
+                onClick={() => setPanelTab("output")}
+              >
+                输出
+              </button>
+              <button type="button" className="panel-tab" disabled>
+                <Terminal size={13} /> 终端
+              </button>
+              <button type="button" className="panel-tab" disabled>
+                调试控制台
+              </button>
+            </div>
+            <div className="panel-actions">
+              <button
+                type="button"
+                className="icon-button panel-action-text"
+                title="清空输出"
+                onClick={() => setOutput("")}
+              >
+                清空
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                title="关闭面板"
+                onClick={() => setPanelVisible(false)}
+              >
+                <X size={14} />
+              </button>
+            </div>
           </div>
-          <div className="problems">
-            {problems.length === 0 ? (
-              <div className="empty">暂无诊断</div>
+          <div className="panel-content">
+            {panelTab === "problems" ? (
+              renderProblemList()
             ) : (
-              problems.map((problem) => (
-                <button
-                  key={`${problem.uri}:${problem.line}:${problem.character}:${problem.message}`}
-                  type="button"
-                  className="problem-row"
-                  onClick={() => {
-                    void openFile(problem.path).then(() => {
-                      editorRef.current?.revealPositionInCenter({
-                        lineNumber: problem.line,
-                        column: problem.character,
-                      });
-                    });
-                  }}
-                >
-                  <span className={`severity s${problem.severity}`}>
-                    {problem.severity === 1 ? "E" : "W"}
-                  </span>
-                  <span className="problem-message">{problem.message}</span>
-                  <span className="problem-loc">
-                      {problem.path.split(/[\\/]/).pop()}:{problem.line}:
-                    {problem.character}
-                  </span>
-                </button>
-              ))
+              <div className="output-wrap">
+                <pre className="output" ref={outputRef}>
+                  {output}
+                </pre>
+                <textarea
+                  className="stdin-input"
+                  value={stdinText}
+                  onChange={(event) => setStdinText(event.target.value)}
+                  placeholder="标准输入（可选）：程序运行前写入 stdin，例如 21"
+                  spellCheck={false}
+                />
+              </div>
             )}
           </div>
-        </div>
-        <div className="bottom-column">
-          <div className="panel-title">输出</div>
-          <pre className="output" ref={outputRef}>
-            {output}
-          </pre>
-          <textarea
-            className="stdin-input"
-            value={stdinText}
-            onChange={(event) => setStdinText(event.target.value)}
-            placeholder="标准输入（可选）：程序运行前写入 stdin，例如 21"
-            spellCheck={false}
-          />
-        </div>
-      </section>
+        </section>
+      ) : null}
 
       <footer className="statusbar">
-        <span>g++ {shortVersion(toolchain?.gxxVersion, "未检测")}</span>
-        <span>
-          clangd {shortVersion(toolchain?.clangdVersion, "未检测")}
+        <button
+          type="button"
+          className="status-item"
+          onClick={() => {
+            showView("problems");
+            showPanel("problems");
+          }}
+        >
+          <CircleAlert size={13} /> {errorCount}
+          <TriangleAlert size={13} /> {warningCount}
+        </button>
+        <button
+          type="button"
+          className="status-item"
+          onClick={() => showView("run")}
+        >
+          <Play size={13} /> 运行
+        </button>
+        <button
+          type="button"
+          className={`status-item${
+            lspStatus.includes("不可用") ? " error" : ""
+          }`}
+          onClick={() => showView("settings")}
+        >
+          {lspStatus}
+        </button>
+        <span className="status-item status-message">{status}</span>
+        <span className="status-spacer" />
+        <button
+          type="button"
+          className="status-item"
+          title="切换面板"
+          onClick={() => setPanelVisible((visible) => !visible)}
+        >
+          <PanelBottom size={13} />
+        </button>
+        <span className="status-item">
+          Ln {cursor.line}, Col {cursor.column}
         </span>
-        <span>{currentPath ?? "未打开文件"}</span>
-        <span className="statusbar-spacer" />
-        <span>{root ?? "未打开工作区"}</span>
+        <span className="status-item">空格: 4</span>
+        <span className="status-item">{activeEncoding}</span>
+        <span className="status-item">{activeEol}</span>
+        <span className="status-item">
+          {languageLabel(activeLanguage)}
+        </span>
+        <span className="status-item">
+          g++ {shortVersion(toolchain?.gxxVersion, "未检测")}
+        </span>
       </footer>
+
+      {paletteOpen ? (
+        <div
+          className="palette-backdrop"
+          onMouseDown={() => setPaletteOpen(false)}
+        >
+          <div className="palette" onMouseDown={(event) => event.stopPropagation()}>
+            <div className="palette-input-row">
+              <Command size={15} />
+              <input
+                autoFocus
+                value={paletteQuery}
+                onChange={(event) => setPaletteQuery(event.target.value)}
+                placeholder="输入命令..."
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setPaletteOpen(false);
+                    return;
+                  }
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setPaletteIndex((index) =>
+                      Math.min(index + 1, filteredCommands.length - 1),
+                    );
+                    return;
+                  }
+                  if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    setPaletteIndex((index) => Math.max(index - 1, 0));
+                    return;
+                  }
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    const command = filteredCommands[paletteIndex];
+                    if (command) runCommand(command.id);
+                  }
+                }}
+              />
+            </div>
+            <div className="palette-list">
+              {filteredCommands.length === 0 ? (
+                <div className="empty">没有匹配的命令</div>
+              ) : (
+                filteredCommands.map((command, index) => (
+                  <button
+                    type="button"
+                    key={command.id}
+                    className={`palette-item${
+                      index === paletteIndex ? " active" : ""
+                    }`}
+                    onMouseEnter={() => setPaletteIndex(index)}
+                    onClick={() => runCommand(command.id)}
+                  >
+                    <span>{command.label}</span>
+                    {command.keybinding ? (
+                      <span className="palette-keybinding">
+                        {command.keybinding}
+                      </span>
+                    ) : null}
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
