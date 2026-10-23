@@ -137,6 +137,11 @@ export interface SignatureHelp {
   activeParameter?: number;
 }
 
+export interface SemanticTokensLegend {
+  tokenTypes: string[];
+  tokenModifiers: string[];
+}
+
 export interface DocumentHighlight {
   range: Range;
   kind?: number;
@@ -223,6 +228,7 @@ class WebSocketWriter extends AbstractMessageWriter implements MessageWriter {
 export type DiagnosticsHandler = (uri: string, diagnostics: Diagnostic[]) => void;
 
 export class LspClient {
+  private semanticLegend: SemanticTokensLegend | null = null;
   private readonly diagnosticsHandlers = new Set<DiagnosticsHandler>();
   private disposed = false;
 
@@ -366,6 +372,49 @@ export class LspClient {
             },
           },
           hover: { contentFormat: ["markdown", "plaintext"] },
+          semanticTokens: {
+            requests: { range: false, full: { delta: false } },
+            tokenTypes: [
+              "namespace",
+              "type",
+              "class",
+              "enum",
+              "interface",
+              "struct",
+              "typeParameter",
+              "parameter",
+              "variable",
+              "property",
+              "enumMember",
+              "event",
+              "function",
+              "method",
+              "macro",
+              "keyword",
+              "modifier",
+              "comment",
+              "string",
+              "number",
+              "regexp",
+              "operator",
+              "decorator",
+            ],
+            tokenModifiers: [
+              "declaration",
+              "definition",
+              "readonly",
+              "static",
+              "deprecated",
+              "abstract",
+              "async",
+              "modification",
+              "documentation",
+              "defaultLibrary",
+            ],
+            formats: ["relative"],
+            overlappingTokenSupport: false,
+            multilineTokenSupport: false,
+          },
           definition: { linkSupport: true },
           references: {},
           documentSymbol: { hierarchicalDocumentSymbolSupport: true },
@@ -390,6 +439,18 @@ export class LspClient {
 
     console.log("[lsp] initialize result", result);
     await this.connection.sendNotification("initialized", {});
+  }
+
+  get semanticTokensLegend(): SemanticTokensLegend | null {
+    return this.semanticLegend;
+  }
+
+  async semanticTokensFull(uri: string): Promise<number[]> {
+    const result = await this.connection.sendRequest<{ data?: number[] } | null>(
+      "textDocument/semanticTokens/full",
+      { textDocument: { uri } },
+    );
+    return result?.data ?? [];
   }
 
   onDiagnostics(handler: DiagnosticsHandler): Disposable {

@@ -72,6 +72,50 @@ import type {
 } from "./types";
 import "./App.css";
 
+const SEMANTIC_TOKEN_TYPES = [
+  "namespace",
+  "type",
+  "class",
+  "enum",
+  "interface",
+  "struct",
+  "typeParameter",
+  "parameter",
+  "variable",
+  "property",
+  "enumMember",
+  "event",
+  "function",
+  "method",
+  "macro",
+  "keyword",
+  "modifier",
+  "comment",
+  "string",
+  "number",
+  "regexp",
+  "operator",
+  "decorator",
+];
+const SEMANTIC_TOKEN_MODIFIERS = [
+  "declaration",
+  "definition",
+  "readonly",
+  "static",
+  "deprecated",
+  "abstract",
+  "async",
+  "modification",
+  "documentation",
+  "defaultLibrary",
+];
+const semanticTypeIndex = new Map(
+  SEMANTIC_TOKEN_TYPES.map((name, index) => [name, index]),
+);
+const semanticModifierIndex = new Map(
+  SEMANTIC_TOKEN_MODIFIERS.map((name, index) => [name, index]),
+);
+
 interface OpenedDoc {
   path: string;
   uri: string;
@@ -1327,6 +1371,54 @@ function App() {
       },
     });
 
+    const semanticTokens = (["cpp", "c"] as const).map((language) =>
+      monaco.languages.registerDocumentSemanticTokensProvider(language, {
+        getLegend: () => ({
+          tokenTypes: SEMANTIC_TOKEN_TYPES,
+          tokenModifiers: SEMANTIC_TOKEN_MODIFIERS,
+        }),
+        provideDocumentSemanticTokens: async (model) => {
+          const lsp = lspRef.current;
+          const legend = lsp?.semanticTokensLegend;
+          if (!lsp || !legend) return null;
+          try {
+            const data = await lsp.semanticTokensFull(
+              model.uri.toString(),
+            );
+            if (data.length === 0) {
+              return { data: new Uint32Array(0) };
+            }
+            const converted = new Uint32Array(data.length);
+            for (let index = 0; index < data.length; index += 5) {
+              converted[index] = data[index];
+              converted[index + 1] = data[index + 1];
+              converted[index + 2] = data[index + 2];
+              const typeName = legend.tokenTypes[data[index + 3]];
+              converted[index + 3] =
+                semanticTypeIndex.get(typeName) ??
+                semanticTypeIndex.get("variable") ??
+                0;
+              let modifiers = 0;
+              const mask = data[index + 4] ?? 0;
+              for (let bit = 0; bit < legend.tokenModifiers.length; bit += 1) {
+                if ((mask & (1 << bit)) === 0) continue;
+                const modifier = semanticModifierIndex.get(
+                  legend.tokenModifiers[bit],
+                );
+                if (modifier !== undefined) modifiers |= 1 << modifier;
+              }
+              converted[index + 4] = modifiers;
+            }
+            return { data: converted };
+          } catch (error) {
+            console.warn("[lsp] semantic tokens failed", error);
+            return null;
+          }
+        },
+        releaseDocumentSemanticTokens: () => undefined,
+      }),
+    );
+
     return () => {
       cursorSubscription.dispose();
       contentSubscription.dispose();
@@ -1342,6 +1434,7 @@ function App() {
       rename.dispose();
       codeActions.dispose();
       applyCodeAction.dispose();
+      for (const provider of semanticTokens) provider.dispose();
       editor.dispose();
       editorRef.current = null;
     };

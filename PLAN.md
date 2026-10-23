@@ -546,7 +546,7 @@ clangd
 | 文档高亮 | `textDocument/documentHighlight` | `registerDocumentHighlightProvider` | P1 |
 | 折叠 | `textDocument/foldingRange` | `registerFoldingRangeProvider` | P1 |
 | 工作区符号 | `workspace/symbol` | Quick Pick | P1 |
-| 语义高亮 | `textDocument/semanticTokens/full` | `registerDocumentSemanticTokensProvider` | P1/P2 |
+| 语义高亮 | `textDocument/semanticTokens/full` | `registerDocumentSemanticTokensProvider` | P1 ✅ |
 | Inlay Hints | `textDocument/inlayHint` | 自定义装饰器 | P2 |
 | 选择范围 | `textDocument/selectionRange` | `registerSelectionRangeProvider` | P2 |
 | 调用层级 | `prepareCallHierarchy` 等 | 自定义树 | P3 |
@@ -1863,6 +1863,6 @@ self.MonacoEnvironment = {
 | 0.2 | 2026-10-22 | P0 完成：最小闭环、clangd 20.1.8、中文路径、测试与实测报告 |
 | 0.3 | 2026-10-23 | M1 文件操作/监视/设置；M2 重命名/代码操作/签名/高亮/工作区符号；P1 搜索/快速打开/构建诊断 |
 | 0.4 | 2026-10-23 | 品牌/无边框窗口、clangd 自恢复、流式构建/取消、首次引导与工作区信任 |
-| 0.5 | 2026-10-24 | 修复窗口圆角/关闭/实时 clangd 诊断；文件树拖拽移动、新建控制台项目向导 |
+| 0.5 | 2026-10-24 | 修复窗口圆角/关闭/实时 clangd 诊断；文件树拖拽移动、新建控制台项目向导、语义高亮 |
 
 > **下一步**：P0 已通过 → 确认第 16 节待决策项 → 进入 M1（编辑器骨架与 clangd 核心）→ 按 P0 数据校准 MVP 排期。
