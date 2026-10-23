@@ -7,18 +7,21 @@ import {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
   ChevronRight,
   CircleAlert,
   Command,
   FileCode2,
+  FilePlus,
   FileText,
   Files,
   Folder,
   FolderOpen,
+  FolderPlus,
   Hammer,
+  Pencil,
   PanelBottom,
   Play,
   RefreshCw,
@@ -26,6 +29,7 @@ import {
   Search,
   Settings,
   Terminal,
+  Trash2,
   TriangleAlert,
   X,
 } from "lucide-react";
@@ -39,18 +43,26 @@ import {
   LspClient,
   normalizePath,
   uriToPath,
+  type CodeAction,
   type CompletionItem,
   type Diagnostic,
   type DocumentSymbol,
   type FoldingRange,
   type Hover,
   type Range,
+  type SymbolInformation,
+  type TextEdit,
+  type WorkspaceEdit,
+  type WorkspaceSymbol,
 } from "./lsp/client";
 import type {
+  AppSettings,
   BuildResult,
+  FileChangeEvent,
   FileData,
   FileEntry,
   LspInfo,
+  SearchMatch,
   ToolchainInfo,
   WorkspaceInfo,
 } from "./types";
@@ -72,10 +84,33 @@ interface ProblemItem {
   severity: number;
   line: number;
   character: number;
+  source: "clangd" | "build";
 }
 
 type SidebarView = "explorer" | "search" | "problems" | "run" | "settings";
 type PanelTab = "problems" | "output";
+type PaletteMode = "commands" | "files" | "symbols";
+
+interface TreeContextMenu {
+  path: string;
+  isDir: boolean;
+  x: number;
+  y: number;
+}
+
+const DEFAULT_SETTINGS: AppSettings = {
+  schemaVersion: 1,
+  editor: {
+    fontSize: 14,
+    tabSize: 4,
+    minimap: true,
+    wordWrap: false,
+  },
+  build: {
+    cxxFlags: ["-std=c++20", "-g", "-O0", "-Wall", "-Wextra"],
+    staticRuntime: true,
+  },
+};
 
 interface OutlineItem {
   name: string;
@@ -132,6 +167,15 @@ function fileIcon(name: string): ReactNode {
     return <FileText size={14} className="icon-cmake" />;
   }
   return <FileText size={14} className="icon-text" />;
+}
+
+function relativeToRoot(path: string, root: string | null): string {
+  if (!root) return path;
+  const normalizedRoot = root.replace(/[\\/]+$/, "").toLowerCase();
+  if (path.toLowerCase().startsWith(normalizedRoot)) {
+    return path.slice(normalizedRoot.length).replace(/^[\\/]+/, "");
+  }
+  return path;
 }
 
 const COMPLETION_KINDS: monaco.languages.CompletionItemKind[] = [
@@ -245,6 +289,19 @@ function toMarkerSeverity(severity?: number): monaco.MarkerSeverity {
   }
 }
 
+function fromMarkerSeverity(severity: monaco.MarkerSeverity): number {
+  switch (severity) {
+    case monaco.MarkerSeverity.Error:
+      return 1;
+    case monaco.MarkerSeverity.Warning:
+      return 2;
+    case monaco.MarkerSeverity.Info:
+      return 3;
+    default:
+      return 4;
+  }
+}
+
 function toMonacoCompletion(
   item: CompletionItem,
   defaultRange: monaco.Range,
@@ -308,6 +365,11 @@ function App() {
   const lspRef = useRef<LspClient | null>(null);
   const docsRef = useRef(new Map<string, OpenedDoc>());
   const autoOpenedRef = useRef(false);
+  const rootRef = useRef<string | null>(null);
+  const currentPathRef = useRef<string | null>(null);
+  const openTabsRef = useRef<string[]>([]);
+  const dirsRef = useRef<Record<string, FileEntry[]>>({});
+  const dirtyPathsRef = useRef<Set<string>>(new Set());
 
   const [root, setRoot] = useState<string | null>(null);
   const [entries, setEntries] = useState<FileEntry[]>([]);
@@ -319,9 +381,23 @@ function App() {
   const [output, setOutput] = useState("// DevCpp++ P0\n// 打开一个文件夹，然后点击 .cpp 文件开始。");
   const [stdinText, setStdinText] = useState("");
   const [problems, setProblems] = useState<ProblemItem[]>([]);
+  const [buildProblems, setBuildProblems] = useState<ProblemItem[]>([]);
   const [status, setStatus] = useState("就绪");
   const [lspStatus, setLspStatus] = useState("LSP 未连接");
   const [toolchain, setToolchain] = useState<ToolchainInfo | null>(null);
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [settingsDraft, setSettingsDraft] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [workspaceFiles, setWorkspaceFiles] = useState<FileEntry[]>([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchMatch[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [treeMenu, setTreeMenu] = useState<TreeContextMenu | null>(null);
+  const [textPrompt, setTextPrompt] = useState<{
+    title: string;
+    value: string;
+    confirm: (value: string) => void;
+  } | null>(null);
+  const [textPromptValue, setTextPromptValue] = useState("");
   const [recent, setRecent] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem("devcpp.recent");
@@ -339,8 +415,32 @@ function App() {
   const [outline, setOutline] = useState<OutlineItem[]>([]);
   const [menuOpen, setMenuOpen] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteMode, setPaletteMode] = useState<PaletteMode>("commands");
   const [paletteQuery, setPaletteQuery] = useState("");
   const [paletteIndex, setPaletteIndex] = useState(0);
+  const [symbolResults, setSymbolResults] = useState<
+    Array<SymbolInformation | WorkspaceSymbol>
+  >([]);
+
+  useEffect(() => {
+    rootRef.current = root;
+  }, [root]);
+
+  useEffect(() => {
+    currentPathRef.current = currentPath;
+  }, [currentPath]);
+
+  useEffect(() => {
+    openTabsRef.current = openTabs;
+  }, [openTabs]);
+
+  useEffect(() => {
+    dirsRef.current = dirs;
+  }, [dirs]);
+
+  useEffect(() => {
+    dirtyPathsRef.current = dirtyPaths;
+  }, [dirtyPaths]);
 
   const rememberRecent = useCallback((path: string) => {
     setRecent((previous) => {
@@ -435,14 +535,74 @@ function App() {
     [openFile],
   );
 
+  const openSearchResult = useCallback(
+    async (match: SearchMatch) => {
+      await openFile(match.path);
+      editorRef.current?.setPosition({
+        lineNumber: match.line,
+        column: match.character,
+      });
+      editorRef.current?.revealPositionInCenter({
+        lineNumber: match.line,
+        column: match.character,
+      });
+    },
+    [openFile],
+  );
+
+  const openWorkspaceSymbol = useCallback(
+    async (symbol: SymbolInformation | WorkspaceSymbol) => {
+      const location = symbol.location;
+      if (!location || !("uri" in location)) return;
+      const path = uriToPath(location.uri);
+      await openFile(path);
+      if ("range" in location) {
+        editorRef.current?.setPosition({
+          lineNumber: location.range.start.line + 1,
+          column: location.range.start.character + 1,
+        });
+        editorRef.current?.revealPositionInCenter({
+          lineNumber: location.range.start.line + 1,
+          column: location.range.start.character + 1,
+        });
+      }
+    },
+    [openFile],
+  );
+
+  const runWorkspaceSearch = useCallback(async () => {
+    if (!root || !searchQuery.trim()) {
+      setSearchResults([]);
+      return;
+    }
+    setSearching(true);
+    try {
+      const matches = await invoke<SearchMatch[]>("search_workspace", {
+        root,
+        query: searchQuery,
+        maxResults: 200,
+      });
+      setSearchResults(matches);
+      setStatus(`搜索到 ${matches.length} 个结果`);
+    } catch (error) {
+      setOutput(String(error));
+      setStatus("搜索失败");
+    } finally {
+      setSearching(false);
+    }
+  }, [root, searchQuery]);
+
   const closeTab = useCallback(
-    (path: string) => {
+    async (path: string): Promise<boolean> => {
       const key = normalizePath(path);
-      if (
-        dirtyPaths.has(key) &&
-        !window.confirm("文件未保存，确定关闭？")
-      ) {
-        return;
+      if (dirtyPaths.has(key)) {
+        const close = await confirmDialog("文件未保存，确定关闭？", {
+          title: "未保存的文件",
+          kind: "warning",
+          okLabel: "关闭",
+          cancelLabel: "取消",
+        });
+        if (!close) return false;
       }
       const nextTabs = openTabs.filter(
         (tab) => normalizePath(tab) !== key,
@@ -473,6 +633,7 @@ function App() {
         next.delete(key);
         return next;
       });
+      return true;
     },
     [currentPath, dirtyPaths, openTabs],
   );
@@ -508,10 +669,90 @@ function App() {
           severity: diagnostic.severity ?? 1,
           line: diagnostic.range.start.line + 1,
           character: diagnostic.range.start.character + 1,
+          source: "clangd" as const,
         })),
       ]);
     },
     [],
+  );
+
+  const applyLspWorkspaceEdit = useCallback(
+    async (edit: WorkspaceEdit): Promise<boolean> => {
+      const groups = new Map<string, TextEdit[]>();
+      if (edit.changes) {
+        for (const [uri, edits] of Object.entries(edit.changes)) {
+          groups.set(uri, edits);
+        }
+      }
+      if (edit.documentChanges) {
+        for (const change of edit.documentChanges) {
+          const documentEdit = change as {
+            textDocument?: { uri: string };
+            edits?: TextEdit[];
+          };
+          if (!documentEdit.textDocument || !documentEdit.edits) {
+            throw new Error("暂不支持 clangd 返回的资源文件操作");
+          }
+          groups.set(documentEdit.textDocument.uri, documentEdit.edits);
+        }
+      }
+
+      const touched: OpenedDoc[] = [];
+      try {
+        for (const [uri, edits] of groups) {
+          const doc = await ensureDocumentByPath(uriToPath(uri));
+          if (!doc) throw new Error(`无法打开编辑目标: ${uri}`);
+          const operations: monaco.editor.IIdentifiedSingleEditOperation[] =
+            edits
+              .map((textEdit) => ({
+                range: toMonacoRange(textEdit.range),
+                text: textEdit.newText,
+                forceMoveMarkers: true,
+              }))
+              .sort(
+                (a, b) =>
+                  b.range.startLineNumber - a.range.startLineNumber ||
+                  b.range.startColumn - a.range.startColumn,
+              );
+          doc.model.pushEditOperations([], operations, () => null);
+          touched.push(doc);
+        }
+
+        const dirtyKeys = new Set(touched.map((doc) => normalizePath(doc.path)));
+        for (const doc of touched) {
+          await invoke("save_text_file", {
+            path: doc.path,
+            content: doc.model.getValue(),
+            encoding: doc.encoding,
+          });
+          lspRef.current?.didSave(doc.uri);
+          dirtyKeys.add(normalizePath(doc.path));
+        }
+        setDirtyPaths((previous) => {
+          const next = new Set(previous);
+          for (const key of dirtyKeys) next.delete(key);
+          return next;
+        });
+
+        for (const doc of touched) {
+          const key = normalizePath(doc.path);
+          const isOpen = openTabsRef.current.some(
+            (tab) => normalizePath(tab) === key,
+          );
+          if (!isOpen && editorRef.current?.getModel() !== doc.model) {
+            lspRef.current?.didClose(doc.uri);
+            doc.model.dispose();
+            docsRef.current.delete(key);
+          }
+        }
+        return true;
+      } catch (error) {
+        setOutput(String(error));
+        setStatus("应用编辑失败");
+        return false;
+      }
+    },
+    [ensureDocumentByPath],
   );
 
   useEffect(() => {
@@ -758,6 +999,212 @@ function App() {
       },
     );
 
+    const signatures = monaco.languages.registerSignatureHelpProvider("cpp", {
+      signatureHelpTriggerCharacters: ["(", ","],
+      signatureHelpRetriggerCharacters: [","],
+      provideSignatureHelp: async (model, position) => {
+        const lsp = lspRef.current;
+        if (!lsp) return null;
+        try {
+          const result = await lsp.signatureHelp(
+            model.uri.toString(),
+            position.lineNumber - 1,
+            position.column - 1,
+          );
+          if (!result) return null;
+          const signatureHelp: monaco.languages.SignatureHelp = {
+            activeSignature: result.activeSignature ?? 0,
+            activeParameter: result.activeParameter ?? 0,
+            signatures: result.signatures.map((signature) => ({
+              label: signature.label,
+              documentation:
+                typeof signature.documentation === "string"
+                  ? signature.documentation
+                  : signature.documentation?.value,
+              parameters:
+                signature.parameters?.map((parameter) => ({
+                  label: parameter.label,
+                  documentation:
+                    typeof parameter.documentation === "string"
+                      ? parameter.documentation
+                      : parameter.documentation?.value,
+                })) ?? [],
+            })),
+          };
+          return { value: signatureHelp, dispose: () => undefined };
+        } catch (error) {
+          console.warn("[lsp] signature help failed", error);
+          return null;
+        }
+      },
+    });
+
+    const highlights = monaco.languages.registerDocumentHighlightProvider(
+      "cpp",
+      {
+        provideDocumentHighlights: async (model, position) => {
+          const lsp = lspRef.current;
+          if (!lsp) return [];
+          try {
+            const result = await lsp.documentHighlights(
+              model.uri.toString(),
+              position.lineNumber - 1,
+              position.column - 1,
+            );
+            return result.map((highlight) => ({
+              range: toMonacoRange(highlight.range),
+              kind:
+                highlight.kind === 3
+                  ? monaco.languages.DocumentHighlightKind.Write
+                  : highlight.kind === 2
+                    ? monaco.languages.DocumentHighlightKind.Read
+                    : monaco.languages.DocumentHighlightKind.Text,
+            }));
+          } catch (error) {
+            console.warn("[lsp] document highlights failed", error);
+            return [];
+          }
+        },
+      },
+    );
+
+    const rename = monaco.languages.registerRenameProvider("cpp", {
+      provideRenameEdits: async (model, position, newName) => {
+        const lsp = lspRef.current;
+        if (!lsp) throw new Error("clangd 未连接");
+        const edit = await lsp.rename(
+          model.uri.toString(),
+          position.lineNumber - 1,
+          position.column - 1,
+          newName,
+        );
+        if (!edit) throw new Error("clangd 没有返回重命名编辑");
+        const applied = await applyLspWorkspaceEdit(edit);
+        if (!applied) throw new Error("应用重命名编辑失败");
+        return { edits: [] };
+      },
+    });
+
+    const codeActions = monaco.languages.registerCodeActionProvider("cpp", {
+      provideCodeActions: async (model, range, context) => {
+        const lsp = lspRef.current;
+        if (!lsp) return { actions: [], dispose: () => undefined };
+        const diagnostics: Diagnostic[] = context.markers.map((marker) => ({
+          range: {
+            start: {
+              line: marker.startLineNumber - 1,
+              character: marker.startColumn - 1,
+            },
+            end: {
+              line: marker.endLineNumber - 1,
+              character: marker.endColumn - 1,
+            },
+          },
+          severity: fromMarkerSeverity(marker.severity),
+          message: marker.message,
+          source: marker.source,
+        }));
+        try {
+          const result = await lsp.codeActions(
+            model.uri.toString(),
+            {
+              start: {
+                line: range.startLineNumber - 1,
+                character: range.startColumn - 1,
+              },
+              end: {
+                line: range.endLineNumber - 1,
+                character: range.endColumn - 1,
+              },
+            },
+            diagnostics,
+          );
+          return {
+            actions: result.map((item) => {
+              if ("command" in item && typeof item.command === "string") {
+                const commandItem = item as {
+                  title: string;
+                  command: string;
+                  arguments?: unknown[];
+                };
+                return {
+                  title: commandItem.title,
+                  command: {
+                    id: "devcpp.applyCodeAction",
+                    title: commandItem.title,
+                    arguments: [commandItem],
+                  },
+                };
+              }
+              const action = item as CodeAction;
+              return {
+                title: action.title,
+                isPreferred: action.isPreferred,
+                disabled: action.disabled?.reason,
+                command: {
+                  id: "devcpp.applyCodeAction",
+                  title: action.title,
+                  arguments: [action],
+                },
+              };
+            }),
+            dispose: () => undefined,
+          };
+        } catch (error) {
+          console.warn("[lsp] code actions failed", error);
+          return { actions: [], dispose: () => undefined };
+        }
+      },
+    });
+
+    const applyCodeAction = editor.addAction({
+      id: "devcpp.applyCodeAction",
+      label: "应用代码操作",
+      run: async (_editor, ...args) => {
+        const lsp = lspRef.current;
+        if (!lsp) return;
+        const item = args[0] as
+          | CodeAction
+          | { title: string; command: string; arguments?: unknown[] };
+        try {
+          if ("edit" in item && item.edit) {
+            await applyLspWorkspaceEdit(item.edit);
+            return;
+          }
+          if ("command" in item) {
+            const command =
+              typeof item.command === "string"
+                ? {
+                    command: item.command,
+                    arguments: (
+                      item as {
+                        title: string;
+                        command: string;
+                        arguments?: unknown[];
+                      }
+                    ).arguments,
+                  }
+                : item.command;
+            if (!command) return;
+            const result = await lsp.executeCommand(
+              command.command,
+              command.arguments,
+            );
+            if (
+              result &&
+              typeof result === "object" &&
+              ("changes" in result || "documentChanges" in result)
+            ) {
+              await applyLspWorkspaceEdit(result as WorkspaceEdit);
+            }
+          }
+        } catch (error) {
+          setOutput(String(error));
+          setStatus("执行代码操作失败");
+        }
+      },
+    });
+
     return () => {
       cursorSubscription.dispose();
       contentSubscription.dispose();
@@ -768,10 +1215,110 @@ function App() {
       formatting.dispose();
       documentSymbols.dispose();
       foldingRanges.dispose();
+      signatures.dispose();
+      highlights.dispose();
+      rename.dispose();
+      codeActions.dispose();
+      applyCodeAction.dispose();
       editor.dispose();
       editorRef.current = null;
     };
-  }, [ensureDocumentByPath]);
+  }, [ensureDocumentByPath, applyLspWorkspaceEdit]);
+
+  const applyEditorSettings = useCallback((next: AppSettings) => {
+    setSettings(next);
+    editorRef.current?.updateOptions({
+      fontSize: next.editor.fontSize,
+      tabSize: next.editor.tabSize,
+      minimap: { enabled: next.editor.minimap, renderCharacters: false, maxColumn: 80 },
+      wordWrap: next.editor.wordWrap ? "on" : "off",
+    });
+  }, []);
+
+  useEffect(() => {
+    void invoke<AppSettings>("load_settings")
+      .then((loaded) => {
+        setSettingsDraft(loaded);
+        applyEditorSettings(loaded);
+      })
+      .catch((error) => {
+        console.warn("[settings] load failed", error);
+      });
+  }, [applyEditorSettings]);
+
+  useEffect(() => {
+    let refreshTimer: number | undefined;
+    const pending = listen<FileChangeEvent>("file:changed", (event) => {
+      const currentRoot = rootRef.current;
+      if (!currentRoot) return;
+      const key = normalizePath(event.payload.path);
+      const rootKey = normalizePath(currentRoot);
+      if (key !== rootKey && !key.startsWith(`${rootKey}\\`)) return;
+
+      const doc = docsRef.current.get(key);
+      if (doc) {
+        if (event.payload.kind === "remove") {
+          setStatus(`文件已被外部删除: ${event.payload.path}`);
+        } else {
+          void invoke<FileData>("read_text_file", {
+            path: event.payload.path,
+          })
+            .then((data) => {
+              if (dirtyPathsRef.current.has(key)) {
+                setStatus("检测到外部修改；本地文件未保存，已保留当前内容");
+                return;
+              }
+              if (data.content !== doc.model.getValue()) {
+                doc.model.setValue(data.content);
+                doc.model.setEOL(
+                  data.eol === "crlf"
+                    ? monaco.editor.EndOfLineSequence.CRLF
+                    : monaco.editor.EndOfLineSequence.LF,
+                );
+                doc.encoding = data.encoding;
+                doc.eol = data.eol;
+                setStatus(`已重新加载外部修改: ${event.payload.path}`);
+              }
+            })
+            .catch((error) => console.warn("[watcher] reload failed", error));
+        }
+      }
+
+      window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        const activeRoot = rootRef.current;
+        if (!activeRoot) return;
+        void (async () => {
+          try {
+            setEntries(
+              await invoke<FileEntry[]>("list_dir", { path: activeRoot }),
+            );
+            const loaded = Object.keys(dirsRef.current);
+            const refreshed = await Promise.all(
+              loaded.map(async (dir) => [
+                dir,
+                await invoke<FileEntry[]>("list_dir", { path: dir }),
+              ] as const),
+            );
+            const nextDirs = { ...dirsRef.current };
+            for (const [dir, children] of refreshed) {
+              nextDirs[dir] = children;
+            }
+            setDirs(nextDirs);
+            setWorkspaceFiles(
+              await invoke<FileEntry[]>("list_files", { root: activeRoot }),
+            );
+          } catch (error) {
+            console.warn("[watcher] refresh failed", error);
+          }
+        })();
+      }, 250);
+    });
+    return () => {
+      window.clearTimeout(refreshTimer);
+      void pending.then((unlisten) => unlisten());
+    };
+  }, []);
 
   useEffect(() => {
     const pending = listen<string>("lsp:log", (event) => {
@@ -816,8 +1363,28 @@ function App() {
   }, [menuOpen]);
 
   useEffect(() => {
+    if (!treeMenu) return;
+    const closeMenu = () => setTreeMenu(null);
+    window.addEventListener("pointerdown", closeMenu);
+    return () => window.removeEventListener("pointerdown", closeMenu);
+  }, [treeMenu]);
+
+  useEffect(() => {
     setPaletteIndex(0);
-  }, [paletteQuery, paletteOpen]);
+  }, [paletteQuery, paletteOpen, paletteMode]);
+
+  useEffect(() => {
+    if (!paletteOpen || paletteMode !== "symbols") return;
+    const timer = window.setTimeout(() => {
+      const lsp = lspRef.current;
+      if (!lsp) return;
+      void lsp
+        .workspaceSymbols(paletteQuery)
+        .then((symbols) => setSymbolResults(symbols.slice(0, 100)))
+        .catch((error) => console.warn("[lsp] workspace symbols failed", error));
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [paletteOpen, paletteMode, paletteQuery]);
 
   const saveCurrent = useCallback(async (): Promise<boolean> => {
     if (!currentPath) return false;
@@ -835,6 +1402,7 @@ function App() {
         next.delete(key);
         return next;
       });
+      lspRef.current?.didSave(doc.uri);
       setStatus("已保存");
       return true;
     } catch (error) {
@@ -844,6 +1412,28 @@ function App() {
     }
   }, [currentPath]);
 
+  const saveAllDocuments = useCallback(async (): Promise<boolean> => {
+    const dirty = Array.from(dirtyPaths);
+    for (const key of dirty) {
+      const doc = docsRef.current.get(key);
+      if (!doc) continue;
+      try {
+        await invoke("save_text_file", {
+          path: doc.path,
+          content: doc.model.getValue(),
+          encoding: doc.encoding,
+        });
+        lspRef.current?.didSave(doc.uri);
+      } catch (error) {
+        setOutput(String(error));
+        setStatus("保存失败，已取消操作");
+        return false;
+      }
+    }
+    setDirtyPaths(new Set());
+    return true;
+  }, [dirtyPaths]);
+
   const formatCurrent = useCallback(async () => {
     if (!currentPath) return;
     await editorRef.current
@@ -852,10 +1442,25 @@ function App() {
     setStatus("已格式化");
   }, [currentPath]);
 
+  const persistSettings = useCallback(async () => {
+    try {
+      const saved = await invoke<AppSettings>("save_settings", {
+        settings: settingsDraft,
+      });
+      setSettingsDraft(saved);
+      applyEditorSettings(saved);
+      setStatus("设置已保存");
+    } catch (error) {
+      setOutput(String(error));
+      setStatus("保存设置失败");
+    }
+  }, [settingsDraft, applyEditorSettings]);
+
   const buildAndRun = useCallback(async () => {
     if (!root || !currentPath) return;
     const saved = await saveCurrent();
     if (!saved) return;
+    setBuildProblems([]);
     setOutput("编译中...");
     setStatus("编译中...");
     try {
@@ -863,18 +1468,66 @@ function App() {
         root,
         file: currentPath,
         stdin: stdinText,
+        cxxFlags: settings.build.cxxFlags,
+        staticRuntime: settings.build.staticRuntime,
       });
+      const diagnostics: ProblemItem[] = (result.diagnostics ?? []).map(
+        (diagnostic) => ({
+          uri: monaco.Uri.file(diagnostic.path).toString(),
+          path: diagnostic.path,
+          message: diagnostic.message,
+          severity:
+            diagnostic.severity === "error"
+              ? 1
+              : diagnostic.severity === "warning"
+                ? 2
+                : 3,
+          line: diagnostic.line,
+          character: diagnostic.character,
+          source: "build",
+        }),
+      );
+      setBuildProblems(diagnostics);
       setOutput(result.output || "(无输出)");
       setStatus(
         result.success
           ? `运行结束 · 退出码 ${result.exitCode} · ${result.durationMs} ms`
           : `构建失败 · 退出码 ${result.exitCode}`,
       );
+      if (!result.success || diagnostics.length > 0) {
+        setPanelTab("problems");
+        setPanelVisible(true);
+      }
     } catch (error) {
       setOutput(String(error));
       setStatus("构建失败");
     }
-  }, [root, currentPath, saveCurrent, stdinText]);
+  }, [root, currentPath, saveCurrent, stdinText, settings.build]);
+
+  const openCommandPalette = useCallback(() => {
+    setMenuOpen(null);
+    setPaletteMode("commands");
+    setPaletteQuery("");
+    setPaletteIndex(0);
+    setPaletteOpen(true);
+  }, []);
+
+  const openQuickOpen = useCallback(() => {
+    setMenuOpen(null);
+    setPaletteMode("files");
+    setPaletteQuery("");
+    setPaletteIndex(0);
+    setPaletteOpen(true);
+  }, []);
+
+  const openWorkspaceSymbols = useCallback(() => {
+    setMenuOpen(null);
+    setPaletteMode("symbols");
+    setPaletteQuery("");
+    setPaletteIndex(0);
+    setSymbolResults([]);
+    setPaletteOpen(true);
+  }, []);
 
   useEffect(() => {
     const element = outputRef.current;
@@ -887,8 +1540,13 @@ function App() {
       const key = event.key.toLowerCase();
       if (ctrl && event.shiftKey && key === "p") {
         event.preventDefault();
-        setMenuOpen(null);
-        setPaletteOpen(true);
+        openCommandPalette();
+        return;
+      }
+      if (ctrl && event.shiftKey && key === "f") {
+        event.preventDefault();
+        setSidebarView("search");
+        setSidebarVisible(true);
         return;
       }
       if (ctrl && event.shiftKey && key === "m") {
@@ -901,8 +1559,12 @@ function App() {
       }
       if (ctrl && key === "p" && !event.shiftKey) {
         event.preventDefault();
-        setMenuOpen(null);
-        setPaletteOpen(true);
+        openQuickOpen();
+        return;
+      }
+      if (ctrl && key === "t") {
+        event.preventDefault();
+        openWorkspaceSymbols();
         return;
       }
       if (ctrl && key === "b") {
@@ -930,15 +1592,29 @@ function App() {
       }
       if (ctrl && key === "w" && currentPath) {
         event.preventDefault();
-        closeTab(currentPath);
+        void closeTab(currentPath);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [buildAndRun, saveCurrent, currentPath, closeTab]);
+  }, [buildAndRun, saveCurrent, currentPath, closeTab, openCommandPalette, openQuickOpen, openWorkspaceSymbols]);
 
   const openWorkspace = useCallback(
     async (selected: string) => {
+      if (dirtyPaths.size > 0) {
+        const shouldSave = await confirmDialog(
+          "有未保存的文件。是否保存并切换工作区？",
+          {
+            title: "未保存的文件",
+            kind: "warning",
+            okLabel: "保存并切换",
+            cancelLabel: "取消",
+          },
+        );
+        if (!shouldSave) return;
+        if (!(await saveAllDocuments())) return;
+      }
+      void invoke("unwatch_workspace").catch(() => undefined);
       editorRef.current?.setModel(null);
       for (const doc of docsRef.current.values()) {
         doc.model.dispose();
@@ -956,8 +1632,12 @@ function App() {
       setOpenTabs([]);
       setDirtyPaths(new Set());
       setProblems([]);
+      setBuildProblems([]);
       setDirs({});
       setExpanded(new Set());
+      setWorkspaceFiles([]);
+      setSearchQuery("");
+      setSearchResults([]);
       setOutput(`工作区: ${selected}`);
       setStatus("正在准备工作区...");
 
@@ -969,6 +1649,12 @@ function App() {
           path: selected,
         });
         setEntries(rootEntries);
+        setWorkspaceFiles(
+          await invoke<FileEntry[]>("list_files", { root: selected }),
+        );
+        void invoke("watch_workspace", { root: selected }).catch((error) =>
+          console.warn("[watcher] start failed", error),
+        );
         const detected = await invoke<ToolchainInfo>("detect_toolchain");
         setToolchain(detected);
         setStatus(
@@ -1028,7 +1714,7 @@ function App() {
         setOutput(String(error));
       }
     },
-    [handleDiagnostics, openFile, rememberRecent],
+    [dirtyPaths, handleDiagnostics, openFile, rememberRecent, saveAllDocuments],
   );
 
   const openFolder = useCallback(async () => {
@@ -1082,9 +1768,206 @@ function App() {
     }
   }, [root]);
 
+  const reloadWorkspaceData = useCallback(async () => {
+    if (!root) return;
+    try {
+      setEntries(await invoke<FileEntry[]>("list_dir", { path: root }));
+      const loaded = Object.keys(dirsRef.current);
+      const refreshed = await Promise.all(
+        loaded.map(async (dir) => [
+          dir,
+          await invoke<FileEntry[]>("list_dir", { path: dir }),
+        ] as const),
+      );
+      const nextDirs = { ...dirsRef.current };
+      for (const [dir, children] of refreshed) {
+        nextDirs[dir] = children;
+      }
+      setDirs(nextDirs);
+      setWorkspaceFiles(
+        await invoke<FileEntry[]>("list_files", { root }),
+      );
+    } catch (error) {
+      setOutput(String(error));
+    }
+  }, [root]);
+
+  const closeDocsUnder = useCallback(
+    async (prefix: string): Promise<boolean> => {
+      const prefixKey = normalizePath(prefix);
+      const matching = Array.from(docsRef.current.values()).filter((doc) => {
+        const key = normalizePath(doc.path);
+        return key === prefixKey || key.startsWith(`${prefixKey}\\`);
+      });
+      for (const doc of matching) await closeTab(doc.path);
+      return !Array.from(docsRef.current.values()).some((doc) => {
+        const key = normalizePath(doc.path);
+        return key === prefixKey || key.startsWith(`${prefixKey}\\`);
+      });
+    },
+    [closeTab],
+  );
+
+  const askText = useCallback(
+    (title: string, initial: string, confirm: (value: string) => void) => {
+      setTextPromptValue(initial);
+      setTextPrompt({ title, value: initial, confirm });
+    },
+    [],
+  );
+
+  const createEntry = useCallback(
+    async (kind: "file" | "directory", base: string) => {
+      if (!root) return;
+      const suggested = kind === "file" ? "main.cpp" : "src";
+      askText(
+        kind === "file" ? "新建文件" : "新建文件夹",
+        suggested,
+        (raw) => {
+          const name = raw.trim();
+          if (!name) return;
+          if (name.includes("..") || /^[\/]/.test(name)) {
+            setStatus("名称不能包含 .. 或绝对路径");
+            return;
+          }
+          const separator = base.includes("\\") ? "\\" : "/";
+          const target = `${base.replace(/[\/]+$/, "")}${separator}${name}`;
+          void (async () => {
+            try {
+              await invoke(
+                kind === "file" ? "create_file" : "create_directory",
+                { root, path: target },
+              );
+              setExpanded((previous) => {
+                const next = new Set(previous);
+                next.add(base);
+                return next;
+              });
+              await reloadWorkspaceData();
+              if (kind === "file") await openFile(target);
+              setStatus(kind === "file" ? "文件已创建" : "文件夹已创建");
+            } catch (error) {
+              setOutput(String(error));
+              setStatus(
+                kind === "file" ? "创建文件失败" : "创建文件夹失败",
+              );
+            }
+          })();
+        },
+      );
+    },
+    [askText, openFile, reloadWorkspaceData, root],
+  );
+
+  const renameEntry = useCallback(
+    async (entry: FileEntry) => {
+      if (!root) return;
+      const oldName = entry.name;
+      askText("重命名", oldName, (raw) => {
+        const newName = raw.trim();
+        if (!newName || newName === oldName) return;
+        if (newName.includes("..") || /[\/]/.test(newName)) {
+          setStatus("名称不能包含路径分隔符");
+          return;
+        }
+        const separator = entry.path.includes("\\") ? "\\" : "/";
+        const parent = entry.path.slice(
+          0,
+          Math.max(
+            entry.path.lastIndexOf("\\"),
+            entry.path.lastIndexOf("/"),
+          ),
+        );
+        const target = `${parent}${separator}${newName}`;
+        const wasCurrent =
+          currentPath !== null &&
+          (normalizePath(currentPath) === normalizePath(entry.path) ||
+            normalizePath(currentPath).startsWith(
+              `${normalizePath(entry.path)}\\`,
+            ));
+        void (async () => {
+          if (!(await closeDocsUnder(entry.path))) return;
+          try {
+            await invoke("rename_path", {
+              root,
+              from: entry.path,
+              to: target,
+            });
+            await reloadWorkspaceData();
+            if (wasCurrent && !entry.isDir) await openFile(target);
+            setStatus("重命名成功");
+          } catch (error) {
+            setOutput(String(error));
+            setStatus("重命名失败");
+          }
+        })();
+      });
+    },
+    [askText, closeDocsUnder, currentPath, openFile, reloadWorkspaceData, root],
+  );
+
+  const deleteEntry = useCallback(
+    async (entry: FileEntry) => {
+      if (!root) return;
+      if (
+        !(await confirmDialog(`将“${entry.name}”移入回收站？`, {
+          title: "删除",
+          kind: "warning",
+          okLabel: "移入回收站",
+          cancelLabel: "取消",
+        }))
+      ) {
+        return;
+      }
+      if (!(await closeDocsUnder(entry.path))) return;
+      try {
+        await invoke("delete_path", {
+          root,
+          path: entry.path,
+          permanent: false,
+        });
+        await reloadWorkspaceData();
+        if (
+          currentPath !== null &&
+          (normalizePath(currentPath) === normalizePath(entry.path) ||
+            normalizePath(currentPath).startsWith(
+              `${normalizePath(entry.path)}\\`,
+            ))
+        ) {
+          setCurrentPath(null);
+          editorRef.current?.setModel(null);
+        }
+        setStatus("已移入回收站");
+      } catch (error) {
+        setOutput(String(error));
+        setStatus("删除失败");
+      }
+    },
+    [closeDocsUnder, currentPath, reloadWorkspaceData, root],
+  );
+
   const runEditorAction = useCallback((action: string) => {
     editorRef.current?.trigger("menu", action, null);
   }, []);
+
+  const restartLsp = useCallback(async () => {
+    if (!root) return;
+    setLspStatus("clangd 重启中...");
+    lspRef.current?.dispose();
+    lspRef.current = null;
+    try {
+      await invoke("stop_lsp");
+      const info = await invoke<LspInfo>("start_lsp", { root });
+      const client = await LspClient.connect(info, root);
+      client.onDiagnostics(handleDiagnostics);
+      lspRef.current = client;
+      setLspStatus(`clangd ${shortVersion(toolchain?.clangdVersion, "已连接")}`);
+      setStatus("clangd 已重启");
+    } catch (error) {
+      setLspStatus("clangd 不可用");
+      setOutput(String(error));
+    }
+  }, [root, toolchain?.clangdVersion, handleDiagnostics]);
 
   const showPanel = useCallback((tab: PanelTab) => {
     setPanelTab(tab);
@@ -1115,7 +1998,6 @@ function App() {
         "",
         "Tauri 2 + React + Monaco Editor + clangd + GCC",
         "计划书: PLAN.md",
-        "P0 报告: docs/P0_REPORT.md",
       ].join("\n"),
     );
     showPanel("output");
@@ -1128,6 +2010,20 @@ function App() {
       run: () => void openFolder(),
     },
     {
+      id: "file.newFile",
+      label: "文件: 新建文件",
+      run: () => {
+        if (root) void createEntry("file", root);
+      },
+    },
+    {
+      id: "file.newFolder",
+      label: "文件: 新建文件夹",
+      run: () => {
+        if (root) void createEntry("directory", root);
+      },
+    },
+    {
       id: "file.openExample",
       label: "文件: 打开示例项目",
       run: () => void openExample(),
@@ -1136,6 +2032,12 @@ function App() {
       id: "file.openCmakeExample",
       label: "文件: 打开 CMake 示例项目",
       run: () => void openCmakeExample(),
+    },
+    {
+      id: "file.quickOpen",
+      label: "文件: 快速打开...",
+      keybinding: "Ctrl+P",
+      run: openQuickOpen,
     },
     {
       id: "file.save",
@@ -1148,7 +2050,7 @@ function App() {
       label: "文件: 关闭编辑器",
       keybinding: "Ctrl+W",
       run: () => {
-        if (currentPath) closeTab(currentPath);
+        if (currentPath) void closeTab(currentPath);
       },
     },
     {
@@ -1176,6 +2078,24 @@ function App() {
       run: () => runEditorAction("editor.action.startFindReplaceAction"),
     },
     {
+      id: "refactor.rename",
+      label: "重构: 重命名符号",
+      keybinding: "F2",
+      run: () => runEditorAction("editor.action.rename"),
+    },
+    {
+      id: "refactor.quickFix",
+      label: "重构: 快速修复",
+      keybinding: "Ctrl+.",
+      run: () => runEditorAction("editor.action.quickFix"),
+    },
+    {
+      id: "view.workspaceSymbols",
+      label: "转到: 工作区符号",
+      keybinding: "Ctrl+T",
+      run: openWorkspaceSymbols,
+    },
+    {
       id: "view.explorer",
       label: "查看: 资源管理器",
       keybinding: "Ctrl+B",
@@ -1184,6 +2104,7 @@ function App() {
     {
       id: "view.search",
       label: "查看: 搜索",
+      keybinding: "Ctrl+Shift+F",
       run: () => showView("search"),
     },
     {
@@ -1204,7 +2125,7 @@ function App() {
       id: "view.palette",
       label: "查看: 命令面板",
       keybinding: "Ctrl+Shift+P",
-      run: () => setPaletteOpen(true),
+      run: openCommandPalette,
     },
     {
       id: "view.toggleSidebar",
@@ -1231,6 +2152,11 @@ function App() {
       run: () => void formatCurrent(),
     },
     {
+      id: "lsp.restart",
+      label: "LSP: 重启 clangd",
+      run: () => void restartLsp(),
+    },
+    {
       id: "help.about",
       label: "帮助: 关于 DevCpp++",
       run: about,
@@ -1247,6 +2173,9 @@ function App() {
       label: "文件",
       items: [
         "file.openFolder",
+        "file.newFile",
+        "file.newFolder",
+        "file.quickOpen",
         "file.openExample",
         "file.openCmakeExample",
         "file.save",
@@ -1262,6 +2191,7 @@ function App() {
       id: "view",
       label: "查看",
       items: [
+        "view.workspaceSymbols",
         "view.explorer",
         "view.search",
         "view.problems",
@@ -1270,6 +2200,11 @@ function App() {
         "view.toggleSidebar",
         "view.togglePanel",
       ],
+    },
+    {
+      id: "refactor",
+      label: "重构",
+      items: ["refactor.rename", "refactor.quickFix"],
     },
     {
       id: "run",
@@ -1298,6 +2233,24 @@ function App() {
         command.label.toLowerCase().includes(normalizedPaletteQuery),
       )
     : commands;
+  const filteredFiles =
+    paletteMode === "files"
+      ? workspaceFiles
+          .filter((file) =>
+            normalizedPaletteQuery
+              ? file.path.toLowerCase().includes(normalizedPaletteQuery)
+              : true,
+          )
+          .slice(0, 100)
+      : [];
+  const filteredSymbols =
+    paletteMode === "symbols" ? symbolResults : [];
+  const paletteItemCount =
+    paletteMode === "files"
+      ? filteredFiles.length
+      : paletteMode === "symbols"
+        ? filteredSymbols.length
+        : filteredCommands.length;
 
   useEffect(() => {
     if (!import.meta.env.DEV || autoOpenedRef.current) return;
@@ -1342,6 +2295,15 @@ function App() {
             className={`tree-row${isActive ? " active" : ""}`}
             style={{ paddingLeft: 8 + depth * 14 }}
             title={item.path}
+            onContextMenu={(event) => {
+              event.preventDefault();
+              setTreeMenu({
+                path: item.path,
+                isDir: item.isDir,
+                x: event.clientX,
+                y: event.clientY,
+              });
+            }}
             onClick={() =>
               item.isDir ? void toggleDir(item.path) : void openFile(item.path)
             }
@@ -1375,11 +2337,12 @@ function App() {
       );
     });
 
+  const allProblems = [...problems, ...buildProblems];
   const renderProblemList = (): ReactNode =>
-    problems.length === 0 ? (
+    allProblems.length === 0 ? (
       <div className="empty">暂无问题</div>
     ) : (
-      problems.map((problem) => (
+      allProblems.map((problem) => (
         <button
           key={`${problem.uri}:${problem.line}:${problem.character}:${problem.message}`}
           type="button"
@@ -1395,6 +2358,7 @@ function App() {
           <span className="problem-loc">
             {problem.path.split(/[\\/]/).pop()}:{problem.line}:
             {problem.character}
+            <span className="problem-source">{problem.source}</span>
           </span>
         </button>
       ))
@@ -1406,14 +2370,61 @@ function App() {
         <>
           <div className="sidebar-header">
             <span>搜索</span>
+            <span className="sidebar-count">{searchResults.length}</span>
           </div>
           <div className="sidebar-body">
-            <input
-              className="search-input"
-              placeholder="搜索（P1 接入）"
-              disabled
-            />
-            <div className="empty">工作区搜索将在 P1 接入。</div>
+            <div className="search-box">
+              <input
+                className="search-input"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void runWorkspaceSearch();
+                }}
+                placeholder="在工作区中搜索"
+                spellCheck={false}
+              />
+              <button
+                type="button"
+                className="icon-button"
+                title="搜索"
+                disabled={!root || searching}
+                onClick={() => void runWorkspaceSearch()}
+              >
+                <Search size={15} />
+              </button>
+            </div>
+            {searching ? (
+              <div className="empty">搜索中...</div>
+            ) : searchResults.length > 0 ? (
+              <div className="search-results">
+                {searchResults.map((match, index) => (
+                  <button
+                    type="button"
+                    className="search-result"
+                    key={`${match.path}:${match.line}:${match.character}:${index}`}
+                    title={`${match.path}:${match.line}:${match.character}`}
+                    onClick={() => void openSearchResult(match)}
+                  >
+                    <span className="search-result-file">
+                      {relativeToRoot(match.path, root)}
+                      <span className="search-result-loc">
+                        :{match.line}:{match.character}
+                      </span>
+                    </span>
+                    <span className="search-result-preview">
+                      {match.preview}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : searchQuery.trim() ? (
+              <div className="empty">没有匹配结果</div>
+            ) : (
+              <div className="empty">
+                输入关键词后按 Enter；支持中文与大小写不敏感匹配。
+              </div>
+            )}
           </div>
         </>
       );
@@ -1496,8 +2507,138 @@ function App() {
         <>
           <div className="sidebar-header">
             <span>设置</span>
+            <button
+              type="button"
+              className="icon-button"
+              title="保存设置"
+              onClick={() => void persistSettings()}
+            >
+              <Save size={15} />
+            </button>
           </div>
           <div className="sidebar-body settings-view">
+            <div className="settings-title">编辑器</div>
+            <label className="setting-row">
+              <span className="setting-label">字体大小</span>
+              <input
+                className="setting-input"
+                type="number"
+                min={10}
+                max={32}
+                value={settingsDraft.editor.fontSize}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    editor: {
+                      ...previous.editor,
+                      fontSize: Number(event.target.value),
+                    },
+                  }))
+                }
+              />
+            </label>
+            <label className="setting-row">
+              <span className="setting-label">Tab 宽度</span>
+              <input
+                className="setting-input"
+                type="number"
+                min={1}
+                max={8}
+                value={settingsDraft.editor.tabSize}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    editor: {
+                      ...previous.editor,
+                      tabSize: Number(event.target.value),
+                    },
+                  }))
+                }
+              />
+            </label>
+            <label className="setting-row">
+              <span className="setting-label">Minimap</span>
+              <input
+                type="checkbox"
+                checked={settingsDraft.editor.minimap}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    editor: {
+                      ...previous.editor,
+                      minimap: event.target.checked,
+                    },
+                  }))
+                }
+              />
+            </label>
+            <label className="setting-row">
+              <span className="setting-label">自动换行</span>
+              <input
+                type="checkbox"
+                checked={settingsDraft.editor.wordWrap}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    editor: {
+                      ...previous.editor,
+                      wordWrap: event.target.checked,
+                    },
+                  }))
+                }
+              />
+            </label>
+            <div className="settings-title">构建</div>
+            <label className="setting-field">
+              <span className="setting-label">g++ 参数</span>
+              <textarea
+                className="setting-textarea"
+                value={settingsDraft.build.cxxFlags.join(" ")}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    build: {
+                      ...previous.build,
+                      cxxFlags: event.target.value
+                        .split(/\s+/)
+                        .filter(Boolean),
+                    },
+                  }))
+                }
+                spellCheck={false}
+              />
+            </label>
+            <label className="setting-row">
+              <span className="setting-label">静态运行库</span>
+              <input
+                type="checkbox"
+                checked={settingsDraft.build.staticRuntime}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    build: {
+                      ...previous.build,
+                      staticRuntime: event.target.checked,
+                    },
+                  }))
+                }
+              />
+            </label>
+            <button
+              type="button"
+              className="side-button primary"
+              onClick={() => void persistSettings()}
+            >
+              <Save size={15} /> 保存设置
+            </button>
+            <button
+              type="button"
+              className="side-button"
+              disabled={!root}
+              onClick={() => void restartLsp()}
+            >
+              <RefreshCw size={15} /> 重启 clangd
+            </button>
             <div className="settings-title">工具链</div>
             {rows.map(([label, value]) => (
               <div className="setting-row" key={label}>
@@ -1508,21 +2649,9 @@ function App() {
               </div>
             ))}
             <div className="side-note">
-              运行 <code>scripts/fetch-toolchain.ps1</code> 下载
-              clangd/CMake/Ninja，或设置 DEVCPP_* 环境变量。
-            </div>
-            <div className="settings-title">快捷键</div>
-            <div className="setting-row">
-              <span className="setting-label">命令面板</span>
-              <span className="setting-value">Ctrl+Shift+P</span>
-            </div>
-            <div className="setting-row">
-              <span className="setting-label">编译运行</span>
-              <span className="setting-value">F11</span>
-            </div>
-            <div className="setting-row">
-              <span className="setting-label">格式化</span>
-              <span className="setting-value">Shift+Alt+F</span>
+              设置保存到用户配置目录。运行
+              <code>scripts/fetch-toolchain.ps1</code>
+              下载 clangd/CMake/Ninja，或设置 DEVCPP_* 环境变量。
             </div>
           </div>
         </>
@@ -1533,6 +2662,28 @@ function App() {
         <div className="sidebar-header">
           <span>资源管理器</span>
           <div className="sidebar-actions">
+            <button
+              type="button"
+              className="icon-button"
+              title="新建文件"
+              disabled={!root}
+              onClick={() => {
+                if (root) void createEntry("file", root);
+              }}
+            >
+              <FilePlus size={15} />
+            </button>
+            <button
+              type="button"
+              className="icon-button"
+              title="新建文件夹"
+              disabled={!root}
+              onClick={() => {
+                if (root) void createEntry("directory", root);
+              }}
+            >
+              <FolderPlus size={15} />
+            </button>
             <button
               type="button"
               className="icon-button"
@@ -1601,8 +2752,8 @@ function App() {
     );
   };
 
-  const problemCount = problems.length;
-  const errorCount = problems.filter((problem) => problem.severity === 1).length;
+  const problemCount = allProblems.length;
+  const errorCount = allProblems.filter((problem) => problem.severity === 1).length;
   const warningCount = problemCount - errorCount;
   const activeDoc = currentPath
     ? docsRef.current.get(normalizePath(currentPath))
@@ -1674,10 +2825,7 @@ function App() {
         <button
           type="button"
           className="command-center"
-          onClick={() => {
-            setMenuOpen(null);
-            setPaletteOpen(true);
-          }}
+          onClick={openCommandPalette}
         >
           <Search size={13} />
           <span>搜索或运行命令</span>
@@ -1777,7 +2925,7 @@ function App() {
                       title="关闭"
                       onClick={(event) => {
                         event.stopPropagation();
-                        closeTab(path);
+                        void closeTab(path);
                       }}
                     >
                       <X size={12} />
@@ -1983,6 +3131,128 @@ function App() {
         </span>
       </footer>
 
+      {textPrompt ? (
+        <div
+          className="palette-backdrop"
+          onMouseDown={() => setTextPrompt(null)}
+        >
+          <div
+            className="text-prompt"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="text-prompt-title">{textPrompt.title}</div>
+            <input
+              className="text-prompt-input"
+              autoFocus
+              value={textPromptValue}
+              onChange={(event) => setTextPromptValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setTextPrompt(null);
+                } else if (event.key === "Enter") {
+                  event.preventDefault();
+                  const confirm = textPrompt.confirm;
+                  const value = textPromptValue;
+                  setTextPrompt(null);
+                  confirm(value);
+                }
+              }}
+            />
+            <div className="text-prompt-actions">
+              <button
+                type="button"
+                className="side-button"
+                onClick={() => setTextPrompt(null)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="side-button primary"
+                onClick={() => {
+                  const confirm = textPrompt.confirm;
+                  const value = textPromptValue;
+                  setTextPrompt(null);
+                  confirm(value);
+                }}
+              >
+                确定
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {treeMenu ? (
+        <div
+          className="context-menu"
+          style={{
+            left: Math.min(treeMenu.x, window.innerWidth - 190),
+            top: Math.min(treeMenu.y, window.innerHeight - 190),
+          }}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="context-item"
+            onClick={() => {
+              const base = treeMenu.isDir
+                ? treeMenu.path
+                : treeMenu.path.replace(/[\\/][^\\/]+$/, "");
+              setTreeMenu(null);
+              void createEntry("file", base);
+            }}
+          >
+            <FilePlus size={14} /> 新建文件
+          </button>
+          <button
+            type="button"
+            className="context-item"
+            onClick={() => {
+              const base = treeMenu.isDir
+                ? treeMenu.path
+                : treeMenu.path.replace(/[\\/][^\\/]+$/, "");
+              setTreeMenu(null);
+              void createEntry("directory", base);
+            }}
+          >
+            <FolderPlus size={14} /> 新建文件夹
+          </button>
+          <div className="context-separator" />
+          <button
+            type="button"
+            className="context-item"
+            onClick={() => {
+              const entry: FileEntry = {
+                name: treeMenu.path.split(/[\\/]/).pop() ?? treeMenu.path,
+                path: treeMenu.path,
+                isDir: treeMenu.isDir,
+              };
+              setTreeMenu(null);
+              void renameEntry(entry);
+            }}
+          >
+            <Pencil size={14} /> 重命名
+          </button>
+          <button
+            type="button"
+            className="context-item danger"
+            onClick={() => {
+              const entry: FileEntry = {
+                name: treeMenu.path.split(/[\\/]/).pop() ?? treeMenu.path,
+                path: treeMenu.path,
+                isDir: treeMenu.isDir,
+              };
+              setTreeMenu(null);
+              void deleteEntry(entry);
+            }}
+          >
+            <Trash2 size={14} /> 移入回收站
+          </button>
+        </div>
+      ) : null}
+
       {paletteOpen ? (
         <div
           className="palette-backdrop"
@@ -1990,12 +3260,18 @@ function App() {
         >
           <div className="palette" onMouseDown={(event) => event.stopPropagation()}>
             <div className="palette-input-row">
-              <Command size={15} />
+              {paletteMode === "files" ? <Files size={15} /> : <Command size={15} />}
               <input
                 autoFocus
                 value={paletteQuery}
                 onChange={(event) => setPaletteQuery(event.target.value)}
-                placeholder="输入命令..."
+                placeholder={
+                  paletteMode === "files"
+                    ? "按文件名搜索..."
+                    : paletteMode === "symbols"
+                      ? "搜索工作区符号..."
+                      : "输入命令..."
+                }
                 onKeyDown={(event) => {
                   if (event.key === "Escape") {
                     event.preventDefault();
@@ -2005,7 +3281,7 @@ function App() {
                   if (event.key === "ArrowDown") {
                     event.preventDefault();
                     setPaletteIndex((index) =>
-                      Math.min(index + 1, filteredCommands.length - 1),
+                      Math.min(index + 1, Math.max(0, paletteItemCount - 1)),
                     );
                     return;
                   }
@@ -2016,15 +3292,79 @@ function App() {
                   }
                   if (event.key === "Enter") {
                     event.preventDefault();
-                    const command = filteredCommands[paletteIndex];
-                    if (command) runCommand(command.id);
+                    if (paletteMode === "files") {
+                      const file = filteredFiles[paletteIndex];
+                      if (file) {
+                        setPaletteOpen(false);
+                        void openFile(file.path);
+                      }
+                    } else if (paletteMode === "symbols") {
+                      const symbol = filteredSymbols[paletteIndex];
+                      if (symbol) {
+                        setPaletteOpen(false);
+                        void openWorkspaceSymbol(symbol);
+                      }
+                    } else {
+                      const command = filteredCommands[paletteIndex];
+                      if (command) runCommand(command.id);
+                    }
                   }
                 }}
               />
             </div>
             <div className="palette-list">
-              {filteredCommands.length === 0 ? (
-                <div className="empty">没有匹配的命令</div>
+              {paletteItemCount === 0 ? (
+                <div className="empty">
+                  {paletteMode === "files"
+                    ? "没有匹配的文件"
+                    : paletteMode === "symbols"
+                      ? "没有匹配的符号"
+                      : "没有匹配的命令"}
+                </div>
+              ) : paletteMode === "files" ? (
+                filteredFiles.map((file, index) => (
+                  <button
+                    type="button"
+                    key={file.path}
+                    className={`palette-item${
+                      index === paletteIndex ? " active" : ""
+                    }`}
+                    onMouseEnter={() => setPaletteIndex(index)}
+                    onClick={() => {
+                      setPaletteOpen(false);
+                      void openFile(file.path);
+                    }}
+                  >
+                    <span className="palette-file">
+                      {fileIcon(file.name)}
+                      <span>{relativeToRoot(file.path, root)}</span>
+                    </span>
+                  </button>
+                ))
+              ) : paletteMode === "symbols" ? (
+                filteredSymbols.map((symbol, index) => (
+                  <button
+                    type="button"
+                    key={`${symbol.name}:${index}`}
+                    className={`palette-item${
+                      index === paletteIndex ? " active" : ""
+                    }`}
+                    onMouseEnter={() => setPaletteIndex(index)}
+                    onClick={() => {
+                      setPaletteOpen(false);
+                      void openWorkspaceSymbol(symbol);
+                    }}
+                  >
+                    <span className="palette-file">
+                      <span>{symbol.name}</span>
+                      {symbol.containerName ? (
+                        <span className="palette-keybinding">
+                          {symbol.containerName}
+                        </span>
+                      ) : null}
+                    </span>
+                  </button>
+                ))
               ) : (
                 filteredCommands.map((command, index) => (
                   <button

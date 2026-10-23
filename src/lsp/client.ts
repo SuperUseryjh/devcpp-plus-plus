@@ -93,6 +93,69 @@ export interface FoldingRange {
   kind?: string;
 }
 
+export interface TextDocumentEdit {
+  textDocument: { uri: string; version?: number | null };
+  edits: TextEdit[];
+}
+
+export interface WorkspaceEdit {
+  changes?: Record<string, TextEdit[]>;
+  documentChanges?: Array<TextDocumentEdit | Record<string, unknown>>;
+}
+
+export interface Command {
+  title: string;
+  command: string;
+  arguments?: unknown[];
+}
+
+export interface CodeAction {
+  title: string;
+  kind?: string;
+  diagnostics?: Diagnostic[];
+  edit?: WorkspaceEdit;
+  command?: Command;
+  isPreferred?: boolean;
+  disabled?: { reason: string };
+}
+
+export interface ParameterInformation {
+  label: string | [number, number];
+  documentation?: string | { kind: string; value: string };
+}
+
+export interface SignatureInformation {
+  label: string;
+  documentation?: string | { kind: string; value: string };
+  parameters?: ParameterInformation[];
+  activeParameter?: number;
+}
+
+export interface SignatureHelp {
+  signatures: SignatureInformation[];
+  activeSignature?: number;
+  activeParameter?: number;
+}
+
+export interface DocumentHighlight {
+  range: Range;
+  kind?: number;
+}
+
+export interface SymbolInformation {
+  name: string;
+  kind: number;
+  location: Location;
+  containerName?: string;
+}
+
+export interface WorkspaceSymbol {
+  name: string;
+  kind: number;
+  location: Location | { uri: string };
+  containerName?: string;
+}
+
 class WebSocketReader extends AbstractMessageReader implements MessageReader {
   private cleanups: Array<() => void> = [];
 
@@ -359,6 +422,12 @@ export class LspClient {
     });
   }
 
+  didSave(uri: string): void {
+    void this.connection.sendNotification("textDocument/didSave", {
+      textDocument: { uri },
+    });
+  }
+
   async completion(
     uri: string,
     line: number,
@@ -445,6 +514,82 @@ export class LspClient {
       textDocument: { uri },
     });
     return result ?? [];
+  }
+
+  async rename(
+    uri: string,
+    line: number,
+    character: number,
+    newName: string,
+  ): Promise<WorkspaceEdit | null> {
+    return this.connection.sendRequest<WorkspaceEdit | null>(
+      "textDocument/rename",
+      {
+        textDocument: { uri },
+        position: { line, character },
+        newName,
+      },
+    );
+  }
+
+  async codeActions(
+    uri: string,
+    range: Range,
+    diagnostics: Diagnostic[],
+  ): Promise<Array<Command | CodeAction>> {
+    const result = await this.connection.sendRequest<
+      Array<Command | CodeAction> | null
+    >("textDocument/codeAction", {
+      textDocument: { uri },
+      range,
+      context: { diagnostics },
+    });
+    return result ?? [];
+  }
+
+  async signatureHelp(
+    uri: string,
+    line: number,
+    character: number,
+  ): Promise<SignatureHelp | null> {
+    return this.connection.sendRequest<SignatureHelp | null>(
+      "textDocument/signatureHelp",
+      {
+        textDocument: { uri },
+        position: { line, character },
+      },
+    );
+  }
+
+  async documentHighlights(
+    uri: string,
+    line: number,
+    character: number,
+  ): Promise<DocumentHighlight[]> {
+    const result = await this.connection.sendRequest<
+      DocumentHighlight[] | null
+    >("textDocument/documentHighlight", {
+      textDocument: { uri },
+      position: { line, character },
+    });
+    return result ?? [];
+  }
+
+  async workspaceSymbols(query: string): Promise<Array<SymbolInformation | WorkspaceSymbol>> {
+    const result = await this.connection.sendRequest<
+      Array<SymbolInformation | WorkspaceSymbol> | null
+    >("workspace/symbol", { query });
+    return result ?? [];
+  }
+
+  async executeCommand(
+    command: string,
+    args?: unknown[],
+  ): Promise<unknown> {
+    return this.connection.sendRequest("workspace/executeCommand", {
+      command,
+      arguments: args ?? [],
+    });
   }
 
   dispose(): void {

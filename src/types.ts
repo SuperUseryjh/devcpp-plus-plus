@@ -36,10 +36,49 @@ export interface LspInfo {
   gxxPath: string;
 }
 
+export interface BuildDiagnostic {
+  path: string;
+  line: number;
+  character: number;
+  severity: string;
+  message: string;
+}
+
 export interface BuildResult {
   success: boolean;
   output: string;
   exitCode: number;
   executable?: string;
   durationMs: number;
+  diagnostics: BuildDiagnostic[];
+}
+
+export interface SearchMatch {
+  path: string;
+  line: number;
+  character: number;
+  preview: string;
+}
+
+export interface FileChangeEvent {
+  path: string;
+  kind: "create" | "modify" | "remove" | "other";
+}
+
+export interface EditorSettings {
+  fontSize: number;
+  tabSize: number;
+  minimap: boolean;
+  wordWrap: boolean;
+}
+
+export interface BuildSettings {
+  cxxFlags: string[];
+  staticRuntime: boolean;
+}
+
+export interface AppSettings {
+  schemaVersion: number;
+  editor: EditorSettings;
+  build: BuildSettings;
 }

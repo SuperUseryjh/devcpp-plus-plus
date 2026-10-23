@@ -4,23 +4,31 @@
 
 技术栈：**Tauri 2 + React + Monaco Editor + clangd + GCC (MinGW-w64)**
 
-> 当前状态：P0 最小闭环已跑通。编辑、clangd 诊断/补全、g++ 编译运行、中文路径构建均已验证。
-> 完整计划见 [`PLAN.md`](./PLAN.md)，实测记录见 [`docs/P0_REPORT.md`](./docs/P0_REPORT.md)。
+> 当前状态：P0 最小闭环已跑通；M1/M2 核心能力、M5/P1 的搜索/重命名/代码操作等已开始接入。
+> 完整计划见 [`PLAN.md`](./PLAN.md)。
 
-## 已实现（P0）
+## 已实现（P0 + M1/M2/P1 部分）
 
 - VS Code 风格布局：菜单栏、活动栏、资源管理器、标签页/面包屑、命令面板、底部面板、状态栏
 - Tauri 桌面窗口 + React + Monaco C++ 编辑器
 - CMakeLists.txt 使用独立 CMake 语法高亮，不会发送给 clangd 检查
 - 打开文件夹 / 文件树 / 多标签页 / 保存 / 最近工作区
+- 新建文件/文件夹、重命名、移入回收站；外部文件变更自动刷新/重载
+- 设置界面与持久化（字体、Tab、Minimap、自动换行、g++ 参数、静态运行库）
 - 工作区扫描 + 自动生成 `.devcpp/compile_commands.json`
 - clangd 20.1.8 LSP over loopback WebSocket
   - 诊断（Problems + Monaco markers）
   - 补全、悬停、跳转定义
+  - 引用、文档符号、格式化、折叠
+  - 重命名、代码操作/快速修复、签名帮助、文档高亮
+  - 工作区符号（Ctrl+T）
 - g++ 单文件编译 + 运行；CMake 项目配置/构建/运行
-- 输出面板显示 stdout/stderr
+- 输出面板显示 stdout/stderr；GCC/CMake 错误解析到 Problems
+- 工作区文本搜索（中文/大小写不敏感）
+- 快速打开文件（Ctrl+P）
+- clangd 手动重启
 - 标准输入文本框（运行前写入 stdin）
-- 格式化（clangd）、引用查找、文档符号/面包屑、代码折叠
+- 格式化（clangd）、引用查找、文档符号/面包屑、代码折叠、代码操作
 - 工具链检测（g++ / gdb / clangd / cmake / ninja 版本）
 - 编码检测（UTF-8 / UTF-16 BOM / GBK 回退）
 - 中文路径构建：原生路径分隔符 + ASCII 构建目录
@@ -61,7 +69,7 @@ npm run tauri build -- --bundles nsis
 # 产物：src-tauri\target\release\bundle\nsis\DevCpp++_0.1.0_x64-setup.exe
 ```
 
-P0 实测：安装包约 **4.45 MiB**，应用 exe 约 **7.8 MiB**。
+构建实测：安装包约 **4.9 MiB**，应用 exe 约 **8 MiB**。
 安装包不包含 clangd / CMake / Ninja（保持轻量）；最终用户需安装 LLVM/CMake/Ninja，
 或把 `tools/` 放到应用目录旁。首次运行下载/内置工具包属于 P1。
 
@@ -72,13 +80,16 @@ npm run build
 cargo test --manifest-path src-tauri\Cargo.toml
 ```
 
-Rust 测试覆盖：
+Rust 测试 **8/8** 通过，覆盖：
 
 - g++ 编译 + 运行（ASCII 路径）
 - g++ 编译 + 运行（中文路径）
 - stdin 转发
 - CMake 配置 / 构建 / 运行
 - clangd LSP initialize / diagnostics / completion / formatting / symbols
+- 文件创建/重命名/删除与路径边界
+- 工作区搜索（中文/ASCII）
+- GCC 构建诊断解析
 
 ## 快捷键
 
@@ -88,7 +99,12 @@ Rust 测试覆盖：
 | `Ctrl+S` | 保存 |
 | `Ctrl+Space` | 触发补全（由 Monaco/clangd 提供） |
 | `Ctrl+W` | 关闭当前标签页 |
-| `Ctrl+Shift+P` / `Ctrl+P` | 命令面板 |
+| `Ctrl+Shift+P` | 命令面板 |
+| `Ctrl+P` | 快速打开文件 |
+| `Ctrl+T` | 工作区符号 |
+| `F2` | 重命名符号 |
+| `Ctrl+.` | 快速修复 |
+| `Ctrl+Shift+F` | 工作区搜索 |
 | `Ctrl+B` / `Ctrl+J` | 切换侧边栏 / 底部面板 |
 | `Shift+Alt+F` | 格式化当前文件 |
 | `F12` | 跳转定义（Monaco 默认） |
@@ -104,17 +120,18 @@ src-tauri/app.manifest  Windows 清单（Common Controls v6 / DPI / long path）
 examples/hello/      示例 C++ 单文件项目
 examples/cmake-hello/ CMake 示例项目
 scripts/             clangd 下载、开发、检查脚本
-docs/P0_REPORT.md    P0 实测报告
 PLAN.md              项目计划书
 tools/clangd/        本地 clangd（git 忽略，由脚本下载）
 tools/cmake/         本地 CMake（git 忽略）
 tools/ninja/         本地 Ninja（git 忽略）
 ```
 
-## 已知限制（P0）
+## 已知限制
 
-- 没有调试器、集成终端、Git、设置 UI、搜索、重命名/代码操作
+- 没有调试器、集成终端、Git
 - CMake 模式为基础实现：单 target、自动选择一个 exe；多 target/运行目标选择后续完善
+- 构建输出目前一次性返回，尚未流式推送/取消
+- 工作区信任、首次启动引导、英文 UI、自动更新尚未完成
 - Monaco 目前全量引入，前端产物约 4 MB gzip 1.1 MB，后续按需裁剪
 - clangd 使用 `--background-index`，大项目索引会占用 CPU/内存
 - 中文输入法（IME）组合输入仍需人工回归测试
@@ -123,4 +140,3 @@ tools/ninja/         本地 Ninja（git 忽略）
 ## 文档
 
 - [项目计划书](./PLAN.md)
-- [P0 实测报告](./docs/P0_REPORT.md)

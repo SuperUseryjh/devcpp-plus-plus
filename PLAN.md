@@ -2,8 +2,7 @@
 
 > **定位**：轻量化、现代化、Windows 优先的 C++ IDE  
 > **技术路线**：Tauri 2 + Monaco Editor + clangd + GCC（MinGW-w64）  
-> **版本**：0.2（P0 已完成） · **日期**：2026-10-22 · **状态**：P0 通过，进入 MVP  
-> **P0 实测报告**：[`docs/P0_REPORT.md`](./docs/P0_REPORT.md)  
+> **版本**：0.3（M1/M2/P1 推进中） · **日期**：2026-10-23 · **状态**：P0 通过，M1/M2 核心已实现，部分 P1 提前完成
 > **代码库**：`devcpp-plus-plus`（暂定名）
 
 ---
@@ -1493,12 +1492,13 @@ base-uri 'self';
 - 多标签页、格式化、引用、文档符号、折叠、最近工作区、stdin 文本框已接入；
 - 前端已按 VS Code 结构重做（菜单栏/活动栏/命令面板/面包屑/大纲/状态栏/底部面板）；
 - CMakeLists.txt 使用 CMake 语言，不再发送给 clangd 检查；
+- M1：新建/重命名/删除、文件监视、外部变更重载、设置持久化、快速打开、全局搜索；
+- M2/P1：重命名、代码操作、签名帮助、文档高亮、工作区符号、构建错误解析到 Problems；
 - 中文临时路径构建测试通过（构建目录回退到 ASCII）；
 - `cargo test` 5 项通过（含 stdin、中文路径、CMake）；`npm run build` 成功；
 - 应用退出后 clangd 无残留；
 - NSIS 发布包 4.45 MiB（exe 7.8 MiB），满足 ≤ 25 MB 目标。
 
-详细记录见 [`docs/P0_REPORT.md`](./docs/P0_REPORT.md)。
 
 ### 14.3 需要安装的工具
 
@@ -1569,6 +1569,7 @@ LLVM 安装包较大（约 1–2 GB），但包含 clangd/clang-format/clang-tid
 
 ### 14.7 P0 后的下一步
 
+- 当前：M1/M2 核心已实现，部分 P1 提前完成；仍缺 clangd 崩溃自动重启、流式构建/取消、工作区信任、首次引导、英文 UI、自动更新等；
 - 若 P0 通过：冻结 MVP 范围，进入 M1；
 - 若 LSP 桥不稳定：改用 Tauri IPC transport，或评估 `vscode-ws-jsonrpc` 的 reader/writer；
 - 若 GCC + 中文路径不可接受：默认构建目录放 ASCII 缓存，保留 GCC；调试/Unicode 场景推荐 LLVM；
@@ -1849,7 +1850,6 @@ self.MonacoEnvironment = {
 - MIEngine：<https://github.com/microsoft/MIEngine>
 - vscode-jsonrpc：<https://github.com/microsoft/vscode-languageserver-node>
 - MSYS2：<https://www.msys2.org/>
-- 本项目 P0 实测报告：[`docs/P0_REPORT.md`](./docs/P0_REPORT.md)
 
 ---
 
@@ -1859,5 +1859,6 @@ self.MonacoEnvironment = {
 |---|---|---|
 | 0.1 | 2026-10-22 | 初版：可行性评估、架构、MVP、排期、风险、环境实测 |
 | 0.2 | 2026-10-22 | P0 完成：最小闭环、clangd 20.1.8、中文路径、测试与实测报告 |
+| 0.3 | 2026-10-23 | M1 文件操作/监视/设置；M2 重命名/代码操作/签名/高亮/工作区符号；P1 搜索/快速打开/构建诊断 |
 
 > **下一步**：P0 已通过 → 确认第 16 节待决策项 → 进入 M1（编辑器骨架与 clangd 核心）→ 按 P0 数据校准 MVP 排期。

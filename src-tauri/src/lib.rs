@@ -4,14 +4,17 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::{Output, Stdio},
+    sync::Mutex as StdMutex,
     time::Instant,
 };
 
 use encoding_rs::{GBK, UTF_16BE, UTF_16LE, UTF_8};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
@@ -32,6 +35,7 @@ use uuid::Uuid;
 #[derive(Default)]
 struct AppState {
     lsp: Mutex<Option<LspHandle>>,
+    watcher: StdMutex<Option<RecommendedWatcher>>,
 }
 
 struct LspHandle {
@@ -86,6 +90,16 @@ struct LspInfo {
     gxx_path: String,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildDiagnostic {
+    path: String,
+    line: u32,
+    character: u32,
+    severity: String,
+    message: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildResult {
@@ -94,6 +108,83 @@ struct BuildResult {
     exit_code: i32,
     executable: Option<String>,
     duration_ms: u64,
+    diagnostics: Vec<BuildDiagnostic>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileChangeEvent {
+    path: String,
+    kind: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchMatch {
+    path: String,
+    line: u32,
+    character: u32,
+    preview: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorSettings {
+    font_size: u32,
+    tab_size: u32,
+    minimap: bool,
+    word_wrap: bool,
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            font_size: 14,
+            tab_size: 4,
+            minimap: true,
+            word_wrap: false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BuildSettings {
+    cxx_flags: Vec<String>,
+    static_runtime: bool,
+}
+
+impl Default for BuildSettings {
+    fn default() -> Self {
+        Self {
+            cxx_flags: vec![
+                "-std=c++20".to_string(),
+                "-g".to_string(),
+                "-O0".to_string(),
+                "-Wall".to_string(),
+                "-Wextra".to_string(),
+            ],
+            static_runtime: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AppSettings {
+    schema_version: u32,
+    editor: EditorSettings,
+    build: BuildSettings,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            schema_version: 1,
+            editor: EditorSettings::default(),
+            build: BuildSettings::default(),
+        }
+    }
 }
 
 #[tauri::command]
@@ -132,7 +223,16 @@ fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
         let name = entry.file_name().to_string_lossy().to_string();
         if matches!(
             name.as_str(),
-            ".git" | ".devcpp" | "node_modules" | "target" | "dist"
+            ".git"
+                | ".devcpp"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | ".cache"
+                | ".idea"
+                | ".vs"
+                | "out"
         ) {
             continue;
         }
@@ -207,6 +307,253 @@ fn save_text_file(path: String, content: String, encoding: String) -> Result<(),
         format!("保存文件失败: {}", e)
     })?;
     Ok(())
+}
+
+#[tauri::command]
+fn create_file(root: String, path: String) -> Result<(), String> {
+    let root_path = normalize_existing_dir(&root)?;
+    let target = PathBuf::from(path);
+    ensure_inside_root(&root_path, &target)?;
+    if target.exists() {
+        return Err(format!("文件已存在: {}", target.display()));
+    }
+    std::fs::write(&target, b"").map_err(|e| format!("创建文件失败: {}", e))
+}
+
+#[tauri::command]
+fn create_directory(root: String, path: String) -> Result<(), String> {
+    let root_path = normalize_existing_dir(&root)?;
+    let target = PathBuf::from(path);
+    ensure_inside_root(&root_path, &target)?;
+    if target.exists() {
+        return Err(format!("路径已存在: {}", target.display()));
+    }
+    std::fs::create_dir(&target).map_err(|e| format!("创建文件夹失败: {}", e))
+}
+
+#[tauri::command]
+fn rename_path(root: String, from: String, to: String) -> Result<(), String> {
+    let root_path = normalize_existing_dir(&root)?;
+    let source = PathBuf::from(from);
+    let target = PathBuf::from(to);
+    ensure_inside_root(&root_path, &source)?;
+    ensure_inside_root(&root_path, &target)?;
+    if !source.exists() {
+        return Err(format!("路径不存在: {}", source.display()));
+    }
+    if target.exists() {
+        return Err(format!("目标已存在: {}", target.display()));
+    }
+    std::fs::rename(&source, &target).map_err(|e| format!("重命名失败: {}", e))
+}
+
+#[tauri::command]
+fn delete_path(root: String, path: String, permanent: bool) -> Result<(), String> {
+    let root_path = normalize_existing_dir(&root)?;
+    let target = PathBuf::from(path);
+    ensure_inside_root(&root_path, &target)?;
+    if normalize_path_for_compare(&root_path) == normalize_path_for_compare(&target) {
+        return Err("不能删除工作区根目录".to_string());
+    }
+    if permanent {
+        if target.is_dir() {
+            std::fs::remove_dir_all(&target).map_err(|e| format!("删除文件夹失败: {}", e))
+        } else {
+            std::fs::remove_file(&target).map_err(|e| format!("删除文件失败: {}", e))
+        }
+    } else {
+        trash::delete(&target).map_err(|e| format!("移入回收站失败: {}", e))
+    }
+}
+
+#[tauri::command]
+fn list_files(root: String) -> Result<Vec<FileEntry>, String> {
+    let root = normalize_existing_dir(&root)?;
+    let mut files = Vec::new();
+    collect_files(&root, &mut files, 0, 5000);
+    files.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    Ok(files)
+}
+
+#[tauri::command]
+async fn search_workspace(
+    root: String,
+    query: String,
+    max_results: Option<usize>,
+) -> Result<Vec<SearchMatch>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        search_workspace_blocking(root, query, max_results)
+    })
+    .await
+    .map_err(|e| format!("搜索任务失败: {}", e))?
+}
+
+fn search_workspace_blocking(
+    root: String,
+    query: String,
+    max_results: Option<usize>,
+) -> Result<Vec<SearchMatch>, String> {
+    let root = normalize_existing_dir(&root)?;
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = max_results.unwrap_or(200).clamp(1, 1000);
+    let mut files = Vec::new();
+    collect_files(&root, &mut files, 0, 5000);
+    let mut matches = Vec::new();
+    for entry in files {
+        if matches.len() >= limit {
+            break;
+        }
+        let path = PathBuf::from(&entry.path);
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.len() > 2 * 1024 * 1024 {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let (_, text) = decode_bytes(&bytes);
+        for (line_index, line) in text.lines().enumerate() {
+            let haystack = line.to_lowercase();
+            let mut offset = 0;
+            while let Some(found) = haystack[offset..].find(&query) {
+                let byte_index = offset + found;
+                let character = line[..byte_index].encode_utf16().count() as u32 + 1;
+                let preview = if line.chars().count() > 240 {
+                    let mut shortened: String = line.chars().take(240).collect();
+                    shortened.push('…');
+                    shortened
+                } else {
+                    line.trim().to_string()
+                };
+                matches.push(SearchMatch {
+                    path: entry.path.clone(),
+                    line: line_index as u32 + 1,
+                    character,
+                    preview,
+                });
+                if matches.len() >= limit {
+                    break;
+                }
+                offset = byte_index + query.len().max(1);
+            }
+            if matches.len() >= limit {
+                break;
+            }
+        }
+    }
+    Ok(matches)
+}
+
+#[tauri::command]
+fn watch_workspace(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+) -> Result<(), String> {
+    let root = normalize_existing_dir(&root)?;
+    let app_handle = app.clone();
+    let root_for_watcher = root.clone();
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+        let event = match result {
+            Ok(event) => event,
+            Err(err) => {
+                eprintln!("[watcher] {}", err);
+                return;
+            }
+        };
+        if matches!(event.kind, EventKind::Access(_)) {
+            return;
+        }
+        let kind = match event.kind {
+            EventKind::Create(_) => "create",
+            EventKind::Modify(_) => "modify",
+            EventKind::Remove(_) => "remove",
+            _ => "other",
+        };
+        for path in event.paths {
+            if is_ignored_relative(&root_for_watcher, &path) {
+                continue;
+            }
+            let _ = app_handle.emit(
+                "file:changed",
+                FileChangeEvent {
+                    path: path.display().to_string(),
+                    kind: kind.to_string(),
+                },
+            );
+        }
+    })
+    .map_err(|e| format!("创建文件监视器失败: {}", e))?;
+    watcher
+        .watch(&root, RecursiveMode::Recursive)
+        .map_err(|e| format!("监视工作区失败: {}", e))?;
+    *state
+        .watcher
+        .lock()
+        .map_err(|_| "文件监视器锁失败".to_string())? = Some(watcher);
+    Ok(())
+}
+
+#[tauri::command]
+fn unwatch_workspace(state: State<'_, AppState>) -> Result<(), String> {
+    *state
+        .watcher
+        .lock()
+        .map_err(|_| "文件监视器锁失败".to_string())? = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_settings(app: AppHandle) -> Result<AppSettings, String> {
+    let path = settings_path(&app)?;
+    if !path.is_file() {
+        return Ok(AppSettings::default());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取设置失败: {}", e))?;
+    match serde_json::from_str::<AppSettings>(&text) {
+        Ok(settings) => Ok(settings),
+        Err(err) => {
+            eprintln!("[settings] 解析失败，使用默认设置: {}", err);
+            Ok(AppSettings::default())
+        }
+    }
+}
+
+#[tauri::command]
+fn save_settings(app: AppHandle, settings: AppSettings) -> Result<AppSettings, String> {
+    let mut settings = settings;
+    settings.schema_version = 1;
+    settings.editor.font_size = settings.editor.font_size.clamp(10, 32);
+    settings.editor.tab_size = settings.editor.tab_size.clamp(1, 8);
+    if settings.build.cxx_flags.iter().any(|flag| flag.contains('\0')) {
+        return Err("编译参数包含非法字符".to_string());
+    }
+    let path = settings_path(&app)?;
+    let text = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("序列化设置失败: {}", e))?;
+    let parent = path.parent().ok_or_else(|| "无效设置路径".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("创建设置目录失败: {}", e))?;
+    let tmp = parent.join(format!(".settings-{}.tmp", Uuid::new_v4()));
+    std::fs::write(&tmp, text).map_err(|e| format!("写入设置失败: {}", e))?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("替换设置失败: {}", e))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("保存设置失败: {}", e)
+    })?;
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -373,6 +720,8 @@ async fn build_and_run(
     root: String,
     file: String,
     stdin: Option<String>,
+    cxx_flags: Option<Vec<String>>,
+    static_runtime: Option<bool>,
 ) -> Result<BuildResult, String> {
     let root = normalize_existing_dir(&root)?;
     let file = PathBuf::from(file);
@@ -380,8 +729,13 @@ async fn build_and_run(
         return Err(format!("文件不存在: {}", file.display()));
     }
     if root.join("CMakeLists.txt").is_file() {
-        return build_and_run_cmake(&root, stdin).await;
+        return build_and_run_cmake(&root, stdin, cxx_flags, static_runtime).await;
     }
+    let flags = cxx_flags.unwrap_or_else(|| BuildSettings::default().cxx_flags);
+    if flags.iter().any(|flag| flag.contains('\0')) {
+        return Err("编译参数包含非法字符".to_string());
+    }
+    let use_static_runtime = static_runtime.unwrap_or(true);
     let gxx = find_gxx().ok_or_else(|| "未找到 g++.exe，请检查 PATH".to_string())?;
     let out_dir = build_output_dir(&root);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建构建目录失败: {}", e))?;
@@ -394,13 +748,7 @@ async fn build_and_run(
     let start = Instant::now();
     let mut cmd = TokioCommand::new(&gxx);
     cmd.current_dir(&root)
-        .arg("-std=c++20")
-        .arg("-g")
-        .arg("-O0")
-        .arg("-Wall")
-        .arg("-Wextra")
-        .arg("-static-libgcc")
-        .arg("-static-libstdc++")
+        .args(&flags)
         .arg(&file)
         .arg("-o")
         .arg(&exe)
@@ -409,6 +757,9 @@ async fn build_and_run(
         .stderr(Stdio::piped())
         .env("LC_ALL", "C")
         .env("LANG", "C");
+    if use_static_runtime {
+        cmd.arg("-static-libgcc").arg("-static-libstdc++");
+    }
     if let Some(path) = path_with_prefix(gxx.parent()) {
         cmd.env("PATH", path);
     }
@@ -419,15 +770,22 @@ async fn build_and_run(
         .output()
         .await
         .map_err(|e| format!("启动 g++ 失败: {}", e))?;
+    let compile_stdout = decode_output(&compile.stdout);
+    let compile_stderr = decode_output(&compile.stderr);
+    let diagnostics = parse_build_diagnostics(
+        &format!("{}{}", compile_stdout, compile_stderr),
+        &root,
+    );
     let mut output = String::new();
     output.push_str(&format!(
-        "> {} -std=c++20 -g -O0 -Wall -Wextra {} -o {}\n",
+        "> {} {} {} -o {}\n",
         gxx.display(),
+        flags.join(" "),
         file.display(),
         exe.display()
     ));
-    output.push_str(&decode_output(&compile.stdout));
-    output.push_str(&decode_output(&compile.stderr));
+    output.push_str(&compile_stdout);
+    output.push_str(&compile_stderr);
 
     if !compile.status.success() {
         return Ok(BuildResult {
@@ -436,6 +794,7 @@ async fn build_and_run(
             exit_code: compile.status.code().unwrap_or(-1),
             executable: None,
             duration_ms: start.elapsed().as_millis() as u64,
+            diagnostics,
         });
     }
 
@@ -450,6 +809,7 @@ async fn build_and_run(
         exit_code: executed.status.code().unwrap_or(-1),
         executable: Some(exe.display().to_string()),
         duration_ms: start.elapsed().as_millis() as u64,
+        diagnostics,
     })
 }
 
@@ -496,6 +856,8 @@ async fn run_program(
 async fn build_and_run_cmake(
     root: &Path,
     stdin: Option<String>,
+    _cxx_flags: Option<Vec<String>>,
+    _static_runtime: Option<bool>,
 ) -> Result<BuildResult, String> {
     let start = Instant::now();
     let gxx = find_gxx().ok_or_else(|| "未找到 g++.exe，请检查 PATH".to_string())?;
@@ -508,6 +870,7 @@ async fn build_and_run_cmake(
                 exit_code: -1,
                 executable: None,
                 duration_ms: start.elapsed().as_millis() as u64,
+                diagnostics: Vec::new(),
             });
         }
     };
@@ -534,9 +897,15 @@ async fn build_and_run_cmake(
         .output()
         .await
         .map_err(|e| format!("启动 cmake 失败: {}", e))?;
+    let build_stdout = decode_output(&build.stdout);
+    let build_stderr = decode_output(&build.stderr);
+    let diagnostics = parse_build_diagnostics(
+        &format!("{}{}", build_stdout, build_stderr),
+        root,
+    );
     let mut output = format!("> cmake --build {}\n", build_dir.display());
-    output.push_str(&decode_output(&build.stdout));
-    output.push_str(&decode_output(&build.stderr));
+    output.push_str(&build_stdout);
+    output.push_str(&build_stderr);
     if !build.status.success() {
         return Ok(BuildResult {
             success: false,
@@ -544,6 +913,7 @@ async fn build_and_run_cmake(
             exit_code: build.status.code().unwrap_or(-1),
             executable: None,
             duration_ms: start.elapsed().as_millis() as u64,
+            diagnostics,
         });
     }
 
@@ -564,6 +934,7 @@ async fn build_and_run_cmake(
         exit_code: executed.status.code().unwrap_or(-1),
         executable: Some(exe.display().to_string()),
         duration_ms: start.elapsed().as_millis() as u64,
+        diagnostics,
     })
 }
 
@@ -687,6 +1058,158 @@ fn normalize_existing_dir(path: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("获取设置目录失败: {}", e))?;
+    Ok(dir.join("settings.json"))
+}
+
+fn normalize_path_for_compare(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+fn ensure_inside_root(root: &Path, target: &Path) -> Result<(), String> {
+    if !target.is_absolute() {
+        return Err("路径必须是绝对路径".to_string());
+    }
+    let root_canon = std::fs::canonicalize(root)
+        .map_err(|e| format!("工作区路径无效: {}", e))?;
+    let target_abs = if target.exists() {
+        std::fs::canonicalize(target)
+            .map_err(|e| format!("目标路径无效: {}", e))?
+    } else {
+        let parent = target
+            .parent()
+            .ok_or_else(|| "目标路径没有父目录".to_string())?;
+        let name = target
+            .file_name()
+            .ok_or_else(|| "目标路径没有文件名".to_string())?;
+        if name == ".." {
+            return Err("目标路径不能越过工作区".to_string());
+        }
+        std::fs::canonicalize(parent)
+            .map_err(|e| format!("目标父目录无效: {}", e))?
+            .join(name)
+    };
+    if !target_abs.starts_with(&root_canon) {
+        return Err("目标路径不在工作区内".to_string());
+    }
+    Ok(())
+}
+
+fn is_ignored_name(name: &str) -> bool {
+    if name.to_lowercase().starts_with(".devcpp-save-") {
+        return true;
+    }
+    matches!(
+        name.to_lowercase().as_str(),
+        ".git"
+            | ".devcpp"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".cache"
+            | ".idea"
+            | ".vs"
+            | "out"
+    )
+}
+
+fn is_ignored_relative(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(is_ignored_name)
+                .unwrap_or(false)
+        })
+}
+
+fn collect_files(dir: &Path, files: &mut Vec<FileEntry>, depth: usize, limit: usize) {
+    if depth > 12 || files.len() >= limit {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if files.len() >= limit {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_ignored_name(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            collect_files(&path, files, depth + 1, limit);
+        } else {
+            files.push(FileEntry {
+                name,
+                path: path.display().to_string(),
+                is_dir: false,
+            });
+        }
+    }
+}
+
+fn parse_build_diagnostics(text: &str, root: &Path) -> Vec<BuildDiagnostic> {
+    let re = match Regex::new(
+        r"(?m)^(.+?):(\d+):(\d+):\s+(fatal error|error|warning|note):\s+(.*)$",
+    ) {
+        Ok(re) => re,
+        Err(_) => return Vec::new(),
+    };
+    let mut diagnostics = Vec::new();
+    for captures in re.captures_iter(text) {
+        let raw_path = captures.get(1).map(|m| m.as_str()).unwrap_or("");
+        let path = PathBuf::from(raw_path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        };
+        let severity = match captures.get(4).map(|m| m.as_str()).unwrap_or("") {
+            "warning" => "warning",
+            "note" => "info",
+            _ => "error",
+        };
+        diagnostics.push(BuildDiagnostic {
+            path: path.display().to_string(),
+            line: captures
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(1),
+            character: captures
+                .get(3)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(1),
+            severity: severity.to_string(),
+            message: captures
+                .get(5)
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_default(),
+        });
+    }
+    diagnostics
+}
+
 fn decode_bytes(bytes: &[u8]) -> (String, String) {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         let (text, _, _) = UTF_8.decode(&bytes[3..]);
@@ -802,7 +1325,16 @@ fn collect_sources_inner(dir: &Path, sources: &mut Vec<PathBuf>, depth: usize) {
         if path.is_dir() {
             if matches!(
                 name.as_str(),
-                ".git" | ".devcpp" | "node_modules" | "target" | "dist" | "build"
+                ".git"
+                    | ".devcpp"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | ".cache"
+                    | ".idea"
+                    | ".vs"
+                    | "out"
             ) {
                 continue;
             }
@@ -1129,8 +1661,18 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_workspace,
             list_dir,
+            list_files,
             read_text_file,
             save_text_file,
+            create_file,
+            create_directory,
+            rename_path,
+            delete_path,
+            search_workspace,
+            watch_workspace,
+            unwatch_workspace,
+            load_settings,
+            save_settings,
             detect_toolchain,
             example_workspace,
             cmake_example_workspace,
@@ -1174,6 +1716,8 @@ mod tests {
             root.display().to_string(),
             file.display().to_string(),
             None,
+            None,
+            None,
         )
         .await
         .expect("build_and_run should not fail at the command boundary");
@@ -1206,6 +1750,8 @@ mod tests {
         let result = build_and_run(
             base.display().to_string(),
             base.join("main.cpp").display().to_string(),
+            None,
+            None,
             None,
         )
         .await
@@ -1250,6 +1796,8 @@ int main() {
             base.display().to_string(),
             base.join("main.cpp").display().to_string(),
             Some("21\n".to_string()),
+            None,
+            None,
         )
         .await
         .expect("build_and_run with stdin");
@@ -1278,6 +1826,8 @@ int main() {
             root.display().to_string(),
             root.join("src/main.cpp").display().to_string(),
             None,
+            None,
+            None,
         )
         .await
         .expect("build_and_run CMake example");
@@ -1299,6 +1849,95 @@ int main() {
             Some(cmake_build_dir(&root)),
             "compile_commands_dir should point at the CMake build directory"
         );
+    }
+
+    #[test]
+    fn file_operations_stay_inside_workspace() {
+        let base = std::env::temp_dir().join(format!(
+            "devcpp-fileops-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp workspace");
+        let root = base.display().to_string();
+
+        create_file(root.clone(), base.join("main.cpp").display().to_string())
+            .expect("create file");
+        create_directory(root.clone(), base.join("src").display().to_string())
+            .expect("create directory");
+        assert!(base.join("main.cpp").is_file());
+        assert!(base.join("src").is_dir());
+
+        let files = list_files(root.clone()).expect("list files");
+        assert!(files.iter().any(|entry| entry.name == "main.cpp"));
+
+        rename_path(
+            root.clone(),
+            base.join("main.cpp").display().to_string(),
+            base.join("app.cpp").display().to_string(),
+        )
+        .expect("rename file");
+        assert!(base.join("app.cpp").is_file());
+
+        delete_path(
+            root.clone(),
+            base.join("app.cpp").display().to_string(),
+            true,
+        )
+        .expect("delete file");
+        assert!(!base.join("app.cpp").exists());
+
+        let outside = std::env::temp_dir().join("devcpp-outside.txt");
+        assert!(create_file(root, outside.display().to_string()).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn search_workspace_finds_chinese_and_ascii() {
+        let base = std::env::temp_dir().join(format!(
+            "devcpp-search-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp workspace");
+        std::fs::write(
+            base.join("main.cpp"),
+            "// 你好，世界\nint main() { return 42; }\n",
+        )
+        .expect("write search fixture");
+        let matches = search_workspace_blocking(
+            base.display().to_string(),
+            "你好".to_string(),
+            Some(10),
+        )
+        .expect("search workspace");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 1);
+        assert_eq!(matches[0].character, 4);
+
+        let matches = search_workspace_blocking(
+            base.display().to_string(),
+            "return 42".to_string(),
+            Some(10),
+        )
+        .expect("search ascii");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 2);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn build_diagnostic_parser_handles_windows_paths() {
+        let root = PathBuf::from(r"D:\work\hello");
+        let text = r"D:\work\hello\main.cpp:12:5: error: expected ';' before '}'
+D:\work\hello\main.cpp:20:1: warning: unused variable 'x'
+";
+        let diagnostics = parse_build_diagnostics(text, &root);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].line, 12);
+        assert_eq!(diagnostics[0].character, 5);
+        assert_eq!(diagnostics[0].severity, "error");
+        assert_eq!(diagnostics[1].severity, "warning");
     }
 
     #[tokio::test]
