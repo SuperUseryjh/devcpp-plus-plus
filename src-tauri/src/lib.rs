@@ -489,6 +489,15 @@ fn rename_path(root: String, from: String, to: String) -> Result<(), String> {
     if target.exists() {
         return Err(format!("目标已存在: {}", target.display()));
     }
+    if source.is_dir() {
+        let source_key = normalize_path_for_compare(&source);
+        let target_key = normalize_path_for_compare(&target);
+        let source_key = source_key.strip_prefix(r"\\?\").unwrap_or(&source_key);
+        let target_key = target_key.strip_prefix(r"\\?\").unwrap_or(&target_key);
+        if target_key == source_key || target_key.starts_with(&format!("{source_key}\\")) {
+            return Err("不能把文件夹移动到自身或其子目录".to_string());
+        }
+    }
     std::fs::rename(&source, &target).map_err(|e| format!("重命名失败: {}", e))
 }
 
@@ -2217,6 +2226,24 @@ int main() {
             Some(cmake_build_dir(&root)),
             "compile_commands_dir should point at the CMake build directory"
         );
+    }
+
+    #[test]
+    fn rename_rejects_moving_folder_into_its_child() {
+        let base = std::env::temp_dir().join(format!(
+            "devcpp-move-check-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(base.join("a").join("b")).expect("create nested dirs");
+        let root = base.display().to_string();
+        let error = rename_path(
+            root,
+            base.join("a").display().to_string(),
+            base.join("a").join("b").join("a").display().to_string(),
+        )
+        .expect_err("moving a folder into its child must fail");
+        assert!(error.contains("自身"), "unexpected error: {error}");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

@@ -358,6 +358,13 @@ textarea:focus-visible {
   color: #ffffff;
 }
 
+.tree-row.drop-target,
+.root-path.drop-target {
+  outline: 1px solid #4daafc;
+  outline-offset: -1px;
+  background: rgba(77, 170, 252, 0.16);
+}
+
 .tree-caret {
   flex: none;
   width: 16px;

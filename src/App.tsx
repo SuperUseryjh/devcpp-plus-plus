@@ -400,6 +400,7 @@ function App() {
   const dirsRef = useRef<Record<string, FileEntry[]>>({});
   const dirtyPathsRef = useRef<Set<string>>(new Set());
   const externalReloadRef = useRef<Set<string>>(new Set());
+  const dragEntryRef = useRef<FileEntry | null>(null);
   const buildOutputBufferRef = useRef("");
   const buildOutputTimerRef = useRef<number | null>(null);
   const titlebarDragTimerRef = useRef<number | null>(null);
@@ -432,6 +433,7 @@ function App() {
   const [searchResults, setSearchResults] = useState<SearchMatch[]>([]);
   const [searching, setSearching] = useState(false);
   const [treeMenu, setTreeMenu] = useState<TreeContextMenu | null>(null);
+  const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [textPrompt, setTextPrompt] = useState<{
     title: string;
     value: string;
@@ -2260,6 +2262,75 @@ ${delay} ms 后自动重启 clangd...`);
     [askText, closeDocsUnder, currentPath, openFile, reloadWorkspaceData, root],
   );
 
+  const moveEntry = useCallback(
+    async (entry: FileEntry, targetDir: string) => {
+      if (!root) return;
+      const sourceKey = normalizePath(entry.path);
+      const targetDirKey = normalizePath(targetDir);
+      const parent = entry.path.slice(
+        0,
+        Math.max(entry.path.lastIndexOf("\\"), entry.path.lastIndexOf("/")),
+      );
+      if (normalizePath(parent) === targetDirKey) {
+        setStatus("文件已在该目录");
+        return;
+      }
+      if (
+        entry.isDir &&
+        (targetDirKey === sourceKey ||
+          targetDirKey.startsWith(`${sourceKey}\\`))
+      ) {
+        setStatus("不能把文件夹移动到自身或其子目录");
+        return;
+      }
+      const separator = targetDir.includes("\\") ? "\\" : "/";
+      const target = `${targetDir.replace(/[\\/]+$/, "")}${separator}${entry.name}`;
+      if (normalizePath(target) === sourceKey) return;
+
+      const wasCurrent =
+        currentPath !== null &&
+        (normalizePath(currentPath) === sourceKey ||
+          normalizePath(currentPath).startsWith(`${sourceKey}\\`));
+      const wasExpandedDir = entry.isDir && expanded.has(entry.path);
+
+      if (!(await closeDocsUnder(entry.path))) return;
+      try {
+        await invoke("rename_path", {
+          root,
+          from: entry.path,
+          to: target,
+        });
+        setExpanded((previous) => {
+          const next = new Set<string>();
+          for (const path of previous) {
+            const key = normalizePath(path);
+            if (key === sourceKey || key.startsWith(`${sourceKey}\\`)) {
+              continue;
+            }
+            next.add(path);
+          }
+          next.add(targetDir);
+          if (wasExpandedDir) next.add(target);
+          return next;
+        });
+        await reloadWorkspaceData();
+        if (wasCurrent && !entry.isDir) await openFile(target);
+        setStatus(`已移动到 ${targetDir}`);
+      } catch (error) {
+        setOutput(String(error));
+        setStatus("移动失败");
+      }
+    },
+    [
+      closeDocsUnder,
+      currentPath,
+      expanded,
+      openFile,
+      reloadWorkspaceData,
+      root,
+    ],
+  );
+
   const deleteEntry = useCallback(
     async (entry: FileEntry) => {
       if (!root) return;
@@ -2648,9 +2719,41 @@ ${delay} ms 后自动重启 clangd...`);
         <div key={item.path}>
           <button
             type="button"
-            className={`tree-row${isActive ? " active" : ""}`}
+            className={`tree-row${isActive ? " active" : ""}${
+              dropTarget === item.path ? " drop-target" : ""
+            }`}
             style={{ paddingLeft: 8 + depth * 14 }}
             title={item.path}
+            draggable
+            onDragStart={(event) => {
+              dragEntryRef.current = item;
+              event.dataTransfer.effectAllowed = "move";
+              event.dataTransfer.setData("text/plain", item.path);
+              setDropTarget(null);
+            }}
+            onDragEnd={() => {
+              dragEntryRef.current = null;
+              setDropTarget(null);
+            }}
+            onDragOver={(event) => {
+              if (!item.isDir || !dragEntryRef.current) return;
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = "move";
+              setDropTarget(item.path);
+            }}
+            onDragLeave={() => {
+              if (dropTarget === item.path) setDropTarget(null);
+            }}
+            onDrop={(event) => {
+              if (!item.isDir) return;
+              event.preventDefault();
+              event.stopPropagation();
+              const source = dragEntryRef.current;
+              dragEntryRef.current = null;
+              setDropTarget(null);
+              if (source) void moveEntry(source, item.path);
+            }}
             onContextMenu={(event) => {
               event.preventDefault();
               setTreeMenu({
@@ -3088,7 +3191,28 @@ ${delay} ms 后自动重启 clangd...`);
         </div>
         <div className="sidebar-body">
           {root ? (
-            <div className="root-path" title={root}>
+            <div
+              className={`root-path${
+                dropTarget === root ? " drop-target" : ""
+              }`}
+              title={`${root}（拖到此处移动到工作区根目录）`}
+              onDragOver={(event) => {
+                if (!dragEntryRef.current) return;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "move";
+                setDropTarget(root);
+              }}
+              onDragLeave={() => {
+                if (dropTarget === root) setDropTarget(null);
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const source = dragEntryRef.current;
+                dragEntryRef.current = null;
+                setDropTarget(null);
+                if (source) void moveEntry(source, root);
+              }}
+            >
               {root}
             </div>
           ) : null}
