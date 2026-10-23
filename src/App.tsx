@@ -2172,6 +2172,52 @@ ${delay} ms 后自动重启 clangd...`);
     [],
   );
 
+  const createConsoleProject = useCallback(async () => {
+    const parent = await open({
+      directory: true,
+      multiple: false,
+      title: "选择项目存放位置",
+    });
+    if (typeof parent !== "string") return;
+    askText("新建控制台项目", "hello-cpp", (raw) => {
+      const name = raw.trim();
+      if (!name) return;
+      if (name.includes("..") || /[\\/]/.test(name)) {
+        setStatus("项目名不能包含路径分隔符");
+        return;
+      }
+      const separator = parent.includes("\\") ? "\\" : "/";
+      const base = parent.replace(/[\\/]+$/, "");
+      const projectDir = `${base}${separator}${name}`;
+      const mainPath = `${projectDir}${separator}main.cpp`;
+      const source = [
+        "#include <iostream>",
+        "",
+        "int main() {",
+        '    std::cout << "Hello from DevCpp++!" << std::endl;',
+        "    return 0;",
+        "}",
+        "",
+      ].join(String.fromCharCode(10));
+      void (async () => {
+        try {
+          await invoke("create_directory", { root: parent, path: projectDir });
+          await invoke("save_text_file", {
+            path: mainPath,
+            content: source,
+            encoding: "utf-8",
+          });
+          await openWorkspace(projectDir);
+          await openFile(mainPath);
+          setStatus(`项目已创建: ${name}`);
+        } catch (error) {
+          setOutput(String(error));
+          setStatus("创建项目失败");
+        }
+      })();
+    });
+  }, [askText, openFile, openWorkspace]);
+
   const createEntry = useCallback(
     async (kind: "file" | "directory", base: string) => {
       if (!root) return;
@@ -2437,6 +2483,11 @@ ${delay} ms 后自动重启 clangd...`);
       run: () => void openFolder(),
     },
     {
+      id: "file.newProject",
+      label: "文件: 新建控制台项目...",
+      run: () => void createConsoleProject(),
+    },
+    {
       id: "file.newFile",
       label: "文件: 新建文件",
       run: () => {
@@ -2600,6 +2651,7 @@ ${delay} ms 后自动重启 clangd...`);
       label: "文件",
       items: [
         "file.openFolder",
+        "file.newProject",
         "file.newFile",
         "file.newFolder",
         "file.quickOpen",
@@ -3622,6 +3674,14 @@ ${delay} ms 后自动重启 clangd...`);
                   >
                     <FolderOpen size={16} /> 打开文件夹
                   </button>
+                  <button
+                    type="button"
+                    className="welcome-button"
+                    onClick={() => void createConsoleProject()}
+                  >
+                    <FolderPlus size={16} /> 新建项目
+                  </button>
+
                   <button
                     type="button"
                     className="welcome-button"
