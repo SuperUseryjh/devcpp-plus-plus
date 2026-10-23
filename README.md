@@ -1,20 +1,23 @@
 # DevCpp++
 
-轻量化、现代化、Windows 优先的 C++ IDE（P0 原型）。
+轻量化、现代化、Windows 优先的 C++ IDE（MVP 硬化版）。
 
 技术栈：**Tauri 2 + React + Monaco Editor + clangd + GCC (MinGW-w64)**
 
-> 当前状态：P0 最小闭环已跑通；M1/M2 核心能力、M5/P1 的搜索/重命名/代码操作等已开始接入。
+> 当前状态：MVP 硬化收尾；品牌图标、无边框窗口、clangd 自恢复、流式构建/取消、首次引导与工作区信任已接入。
 > 完整计划见 [`PLAN.md`](./PLAN.md)。
 
 ## 已实现（P0 + M1/M2/P1 部分）
 
+- 原创 D++ Logo 与全套应用图标（标题栏 / exe / NSIS）
+- 无边框一体化窗口 + 自定义标题栏，保留拖动/缩放/Snap/最小化/最大化/关闭
 - VS Code 风格布局：菜单栏、活动栏、资源管理器、标签页/面包屑、命令面板、底部面板、状态栏
 - Tauri 桌面窗口 + React + Monaco C++ 编辑器
 - CMakeLists.txt 使用独立 CMake 语法高亮，不会发送给 clangd 检查
 - 打开文件夹 / 文件树 / 多标签页 / 保存 / 最近工作区
 - 新建文件/文件夹、重命名、移入回收站；外部文件变更自动刷新/重载
-- 设置界面与持久化（字体、Tab、Minimap、自动换行、g++ 参数、静态运行库）
+- 设置界面与持久化（字体、Tab、Minimap、自动换行、g++ 参数、静态运行库、外部控制台）
+- 首次启动工具链引导；工作区信任与受限模式
 - 工作区扫描 + 自动生成 `.devcpp/compile_commands.json`
 - clangd 20.1.8 LSP over loopback WebSocket
   - 诊断（Problems + Monaco markers）
@@ -23,10 +26,12 @@
   - 重命名、代码操作/快速修复、签名帮助、文档高亮
   - 工作区符号（Ctrl+T）
 - g++ 单文件编译 + 运行；CMake 项目配置/构建/运行
+- 构建输出流式显示；可取消构建并回收进程树
 - 输出面板显示 stdout/stderr；GCC/CMake 错误解析到 Problems
+- 外部控制台运行选项
 - 工作区文本搜索（中文/大小写不敏感）
 - 快速打开文件（Ctrl+P）
-- clangd 手动重启
+- clangd 崩溃自动恢复（退避 + 上限）与手动重启
 - 标准输入文本框（运行前写入 stdin）
 - 格式化（clangd）、引用查找、文档符号/面包屑、代码折叠、代码操作
 - 工具链检测（g++ / gdb / clangd / cmake / ninja 版本）
@@ -130,12 +135,12 @@ tools/ninja/         本地 Ninja（git 忽略）
 
 - 没有调试器、集成终端、Git
 - CMake 模式为基础实现：单 target、自动选择一个 exe；多 target/运行目标选择后续完善
-- 构建输出目前一次性返回，尚未流式推送/取消
-- 工作区信任、首次启动引导、英文 UI、自动更新尚未完成
+- 英文 UI、自动更新尚未完成
+- 文件树拖拽尚未实现
 - Monaco 目前全量引入，前端产物约 4 MB gzip 1.1 MB，后续按需裁剪
 - clangd 使用 `--background-index`，大项目索引会占用 CPU/内存
 - 中文输入法（IME）组合输入仍需人工回归测试
-- 安装包/签名/自动更新尚未接入
+- 代码签名/自动更新尚未接入
 
 ## 文档
 

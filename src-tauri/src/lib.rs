@@ -4,7 +4,10 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::{Output, Stdio},
-    sync::Mutex as StdMutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::Instant,
 };
 
@@ -16,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpListener,
     process::{
         Child, ChildStderr, ChildStdin, ChildStdout, Command as TokioCommand,
@@ -36,10 +39,19 @@ use uuid::Uuid;
 struct AppState {
     lsp: Mutex<Option<LspHandle>>,
     watcher: StdMutex<Option<RecommendedWatcher>>,
+    build_cancel: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 struct LspHandle {
     shutdown: oneshot::Sender<()>,
+    intentional: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LspStopped {
+    intentional: bool,
+    reason: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -109,6 +121,131 @@ struct BuildResult {
     executable: Option<String>,
     duration_ms: u64,
     diagnostics: Vec<BuildDiagnostic>,
+    cancelled: bool,
+}
+
+struct BuildCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+    cancelled: bool,
+}
+
+async fn stream_build_output<R>(
+    reader: R,
+    stream: &'static str,
+    app: AppHandle,
+    buffer: Arc<Mutex<String>>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let text = format!("{}
+", line);
+        buffer.lock().await.push_str(&text);
+        let _ = app.emit(
+            "build:event",
+            json!({ "kind": "output", "stream": stream, "text": text }),
+        );
+    }
+}
+
+fn kill_process_tree(pid: Option<u32>) {
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("taskkill");
+        command
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(0x0800_0000);
+        let _ = command.output();
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
+}
+
+async fn run_build_command(
+    mut cmd: TokioCommand,
+    app: Option<AppHandle>,
+    cancel: Option<oneshot::Receiver<()>>,
+) -> Result<BuildCommandOutput, String> {
+    let Some(app) = app else {
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("启动构建进程失败: {}", e))?;
+        return Ok(BuildCommandOutput {
+            status: output.status,
+            stdout: decode_output(&output.stdout),
+            stderr: decode_output(&output.stderr),
+            cancelled: false,
+        });
+    };
+
+    let _ = app.emit(
+        "build:event",
+        json!({ "kind": "started", "text": "正在构建..." }),
+    );
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("启动构建进程失败: {}", e))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法获取构建 stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法获取构建 stderr".to_string())?;
+    let stdout_buffer = Arc::new(Mutex::new(String::new()));
+    let stderr_buffer = Arc::new(Mutex::new(String::new()));
+    let stdout_task = tokio::spawn(stream_build_output(
+        stdout,
+        "stdout",
+        app.clone(),
+        stdout_buffer.clone(),
+    ));
+    let stderr_task = tokio::spawn(stream_build_output(
+        stderr,
+        "stderr",
+        app,
+        stderr_buffer.clone(),
+    ));
+
+    let cancel_fut = async move {
+        if let Some(receiver) = cancel {
+            let _ = receiver.await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    let (status, cancelled) = tokio::select! {
+        status = child.wait() => (
+            status.map_err(|e| format!("等待构建进程失败: {}", e))?,
+            false,
+        ),
+        _ = cancel_fut => {
+            kill_process_tree(child.id());
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| format!("等待构建进程失败: {}", e))?;
+            (status, true)
+        }
+    };
+
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    let stdout = stdout_buffer.lock().await.clone();
+    let stderr = stderr_buffer.lock().await.clone();
+    Ok(BuildCommandOutput {
+        status,
+        stdout,
+        stderr,
+        cancelled,
+    })
 }
 
 #[derive(Clone, Serialize)]
@@ -148,10 +285,11 @@ impl Default for EditorSettings {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct BuildSettings {
     cxx_flags: Vec<String>,
     static_runtime: bool,
+    external_console: bool,
 }
 
 impl Default for BuildSettings {
@@ -165,6 +303,7 @@ impl Default for BuildSettings {
                 "-Wextra".to_string(),
             ],
             static_runtime: true,
+            external_console: false,
         }
     }
 }
@@ -175,6 +314,10 @@ struct AppSettings {
     schema_version: u32,
     editor: EditorSettings,
     build: BuildSettings,
+    #[serde(default)]
+    trusted_workspaces: Vec<String>,
+    #[serde(default)]
+    onboarding_completed: bool,
 }
 
 impl Default for AppSettings {
@@ -183,6 +326,8 @@ impl Default for AppSettings {
             schema_version: 1,
             editor: EditorSettings::default(),
             build: BuildSettings::default(),
+            trusted_workspaces: Vec::new(),
+            onboarding_completed: false,
         }
     }
 }
@@ -605,6 +750,7 @@ async fn start_lsp(
 ) -> Result<LspInfo, String> {
     let root = normalize_existing_dir(&root)?;
     if let Some(old) = state.lsp.lock().await.take() {
+        old.intentional.store(true, Ordering::SeqCst);
         let _ = old.shutdown.send(());
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
@@ -677,6 +823,8 @@ async fn start_lsp_session(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let token_for_bridge = token.clone();
+    let intentional = Arc::new(AtomicBool::new(false));
+    let intentional_for_bridge = intentional.clone();
     tokio::spawn(async move {
         if let Err(err) = run_bridge(
             listener,
@@ -687,6 +835,7 @@ async fn start_lsp_session(
             child,
             app,
             shutdown_rx,
+            intentional_for_bridge,
         )
         .await
         {
@@ -703,6 +852,7 @@ async fn start_lsp_session(
         },
         LspHandle {
             shutdown: shutdown_tx,
+            intentional,
         },
     ))
 }
@@ -710,6 +860,7 @@ async fn start_lsp_session(
 #[tauri::command]
 async fn stop_lsp(state: State<'_, AppState>) -> Result<(), String> {
     if let Some(handle) = state.lsp.lock().await.take() {
+        handle.intentional.store(true, Ordering::SeqCst);
         let _ = handle.shutdown.send(());
     }
     Ok(())
@@ -723,13 +874,90 @@ async fn build_and_run(
     cxx_flags: Option<Vec<String>>,
     static_runtime: Option<bool>,
 ) -> Result<BuildResult, String> {
+    build_and_run_core(
+        root,
+        file,
+        stdin,
+        cxx_flags,
+        static_runtime,
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn build_and_run_stream(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+    file: String,
+    stdin: Option<String>,
+    cxx_flags: Option<Vec<String>>,
+    static_runtime: Option<bool>,
+    external_console: Option<bool>,
+) -> Result<BuildResult, String> {
+    let settings = load_settings(app.clone())?;
+    let normalized_root = normalize_path_for_compare(Path::new(&root));
+    let trusted = settings
+        .trusted_workspaces
+        .iter()
+        .any(|path| normalize_path_for_compare(Path::new(path)) == normalized_root);
+    if !trusted {
+        return Err("工作区未信任：请先在受限模式横幅中信任此工作区".to_string());
+    }
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    *state.build_cancel.lock().await = Some(cancel_tx);
+    let result = build_and_run_core(
+        root,
+        file,
+        stdin,
+        cxx_flags,
+        static_runtime,
+        Some(app),
+        Some(cancel_rx),
+        external_console.unwrap_or(false),
+    )
+    .await;
+    *state.build_cancel.lock().await = None;
+    result
+}
+
+#[tauri::command]
+async fn cancel_build(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(cancel) = state.build_cancel.lock().await.take() {
+        let _ = cancel.send(());
+    }
+    Ok(())
+}
+
+async fn build_and_run_core(
+    root: String,
+    file: String,
+    stdin: Option<String>,
+    cxx_flags: Option<Vec<String>>,
+    static_runtime: Option<bool>,
+    app: Option<AppHandle>,
+    cancel: Option<oneshot::Receiver<()>>,
+    external_console: bool,
+) -> Result<BuildResult, String> {
     let root = normalize_existing_dir(&root)?;
     let file = PathBuf::from(file);
     if !file.is_file() {
         return Err(format!("文件不存在: {}", file.display()));
     }
     if root.join("CMakeLists.txt").is_file() {
-        return build_and_run_cmake(&root, stdin, cxx_flags, static_runtime).await;
+        return build_and_run_cmake(
+            &root,
+            stdin,
+            cxx_flags,
+            static_runtime,
+            app,
+            cancel,
+            external_console,
+        )
+        .await;
     }
     let flags = cxx_flags.unwrap_or_else(|| BuildSettings::default().cxx_flags);
     if flags.iter().any(|flag| flag.contains('\0')) {
@@ -766,12 +994,10 @@ async fn build_and_run(
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
 
-    let compile = cmd
-        .output()
-        .await
-        .map_err(|e| format!("启动 g++ 失败: {}", e))?;
-    let compile_stdout = decode_output(&compile.stdout);
-    let compile_stderr = decode_output(&compile.stderr);
+    let compile = run_build_command(cmd, app, cancel).await?;
+    let compile_status = compile.status;
+    let compile_stdout = compile.stdout;
+    let compile_stderr = compile.stderr;
     let diagnostics = parse_build_diagnostics(
         &format!("{}{}", compile_stdout, compile_stderr),
         &root,
@@ -787,18 +1013,31 @@ async fn build_and_run(
     output.push_str(&compile_stdout);
     output.push_str(&compile_stderr);
 
-    if !compile.status.success() {
+    if compile.cancelled {
         return Ok(BuildResult {
             success: false,
             output,
-            exit_code: compile.status.code().unwrap_or(-1),
+            exit_code: -1,
             executable: None,
             duration_ms: start.elapsed().as_millis() as u64,
             diagnostics,
+            cancelled: true,
         });
     }
 
-    let executed = run_program(&exe, &root, &gxx, stdin).await?;
+    if !compile_status.success() {
+        return Ok(BuildResult {
+            success: false,
+            output,
+            exit_code: compile_status.code().unwrap_or(-1),
+            executable: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            diagnostics,
+            cancelled: false,
+        });
+    }
+
+    let executed = run_program(&exe, &root, &gxx, stdin, external_console).await?;
     output.push_str("\n--- 程序输出 ---\n");
     output.push_str(&decode_output(&executed.stdout));
     output.push_str(&decode_output(&executed.stderr));
@@ -810,6 +1049,7 @@ async fn build_and_run(
         executable: Some(exe.display().to_string()),
         duration_ms: start.elapsed().as_millis() as u64,
         diagnostics,
+        cancelled: false,
     })
 }
 
@@ -818,7 +1058,11 @@ async fn run_program(
     root: &Path,
     gxx: &Path,
     stdin: Option<String>,
+    external_console: bool,
 ) -> Result<Output, String> {
+    if external_console {
+        return run_program_external(exe, root, gxx).await;
+    }
     let mut run = TokioCommand::new(exe);
     run.current_dir(root)
         .stdout(Stdio::piped())
@@ -853,11 +1097,36 @@ async fn run_program(
         .map_err(|e| format!("等待程序结束失败: {}", e))
 }
 
+async fn run_program_external(exe: &Path, root: &Path, gxx: &Path) -> Result<Output, String> {
+    let mut run = TokioCommand::new(exe);
+    run.current_dir(root)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(path) = path_with_prefix(gxx.parent()) {
+        run.env("PATH", path);
+    }
+    #[cfg(windows)]
+    run.creation_flags(0x0000_0010);
+    let status = run
+        .status()
+        .await
+        .map_err(|e| format!("在外部控制台运行程序失败: {}", e))?;
+    Ok(Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    })
+}
+
 async fn build_and_run_cmake(
     root: &Path,
     stdin: Option<String>,
     _cxx_flags: Option<Vec<String>>,
     _static_runtime: Option<bool>,
+    app: Option<AppHandle>,
+    cancel: Option<oneshot::Receiver<()>>,
+    external_console: bool,
 ) -> Result<BuildResult, String> {
     let start = Instant::now();
     let gxx = find_gxx().ok_or_else(|| "未找到 g++.exe，请检查 PATH".to_string())?;
@@ -871,6 +1140,7 @@ async fn build_and_run_cmake(
                 executable: None,
                 duration_ms: start.elapsed().as_millis() as u64,
                 diagnostics: Vec::new(),
+                cancelled: false,
             });
         }
     };
@@ -893,12 +1163,10 @@ async fn build_and_run_cmake(
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
 
-    let build = cmd
-        .output()
-        .await
-        .map_err(|e| format!("启动 cmake 失败: {}", e))?;
-    let build_stdout = decode_output(&build.stdout);
-    let build_stderr = decode_output(&build.stderr);
+    let build = run_build_command(cmd, app, cancel).await?;
+    let build_status = build.status;
+    let build_stdout = build.stdout;
+    let build_stderr = build.stderr;
     let diagnostics = parse_build_diagnostics(
         &format!("{}{}", build_stdout, build_stderr),
         root,
@@ -906,14 +1174,27 @@ async fn build_and_run_cmake(
     let mut output = format!("> cmake --build {}\n", build_dir.display());
     output.push_str(&build_stdout);
     output.push_str(&build_stderr);
-    if !build.status.success() {
+    if build.cancelled {
         return Ok(BuildResult {
             success: false,
             output,
-            exit_code: build.status.code().unwrap_or(-1),
+            exit_code: -1,
             executable: None,
             duration_ms: start.elapsed().as_millis() as u64,
             diagnostics,
+            cancelled: true,
+        });
+    }
+
+    if !build_status.success() {
+        return Ok(BuildResult {
+            success: false,
+            output,
+            exit_code: build_status.code().unwrap_or(-1),
+            executable: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            diagnostics,
+            cancelled: false,
         });
     }
 
@@ -923,7 +1204,7 @@ async fn build_and_run_cmake(
             build_dir.display()
         )
     })?;
-    let executed = run_program(&exe, root, &gxx, stdin).await?;
+    let executed = run_program(&exe, root, &gxx, stdin, external_console).await?;
     output.push_str("\n--- 程序输出 ---\n");
     output.push_str(&decode_output(&executed.stdout));
     output.push_str(&decode_output(&executed.stderr));
@@ -935,6 +1216,7 @@ async fn build_and_run_cmake(
         executable: Some(exe.display().to_string()),
         duration_ms: start.elapsed().as_millis() as u64,
         diagnostics,
+        cancelled: false,
     })
 }
 
@@ -1516,6 +1798,7 @@ async fn run_bridge(
     mut child: Child,
     app: Option<AppHandle>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    intentional: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let (stream, _) = listener
         .accept()
@@ -1531,10 +1814,11 @@ async fn run_bridge(
     let mut stdin = stdin;
     let mut stdout = BufReader::new(stdout);
 
+    let log_app = app.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(app) = &app {
+            if let Some(app) = &log_app {
                 let _ = app.emit("lsp:log", line);
             } else {
                 eprintln!("[clangd] {}", line);
@@ -1542,9 +1826,20 @@ async fn run_bridge(
         }
     });
 
+    let stop_reason: String;
     loop {
         tokio::select! {
-            _ = &mut shutdown_rx => break,
+            _ = &mut shutdown_rx => {
+                stop_reason = "LSP 已主动停止".to_string();
+                break;
+            }
+            status = child.wait() => {
+                stop_reason = match status {
+                    Ok(status) => format!("clangd 已退出: {}", status),
+                    Err(err) => format!("等待 clangd 退出失败: {}", err),
+                };
+                break;
+            }
             incoming = ws_rx.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
@@ -1554,7 +1849,10 @@ async fn run_bridge(
                     Some(Ok(Message::Ping(payload))) => {
                         let _ = ws_tx.send(Message::Pong(payload)).await;
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => {
+                        stop_reason = "WebSocket 已断开".to_string();
+                        break;
+                    }
                     Some(Err(err)) => return Err(format!("WebSocket 读取失败: {}", err)),
                     _ => {}
                 }
@@ -1567,7 +1865,10 @@ async fn run_bridge(
                             .await
                             .map_err(|e| format!("发送 WebSocket 消息失败: {}", e))?;
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        stop_reason = "clangd 输出已关闭".to_string();
+                        break;
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -1575,6 +1876,16 @@ async fn run_bridge(
     }
 
     let _ = child.kill().await;
+    let intentional = intentional.load(Ordering::SeqCst);
+    if let Some(app) = &app {
+        let _ = app.emit(
+            "lsp:stopped",
+            LspStopped {
+                intentional,
+                reason: stop_reason,
+            },
+        );
+    }
     Ok(())
 }
 
@@ -1678,7 +1989,9 @@ pub fn run() {
             cmake_example_workspace,
             start_lsp,
             stop_lsp,
-            build_and_run
+            build_and_run,
+            build_and_run_stream,
+            cancel_build
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

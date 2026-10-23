@@ -750,6 +750,7 @@ dependencies = [
  "trash",
  "uuid",
  "which",
+ "windows",
 ]
 
 [[package]]

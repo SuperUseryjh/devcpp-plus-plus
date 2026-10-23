@@ -51,6 +51,18 @@ export interface BuildResult {
   executable?: string;
   durationMs: number;
   diagnostics: BuildDiagnostic[];
+  cancelled: boolean;
+}
+
+export interface BuildEvent {
+  kind: "started" | "output" | "finished";
+  stream?: "stdout" | "stderr";
+  text?: string;
+}
+
+export interface LspStopped {
+  intentional: boolean;
+  reason: string;
 }
 
 export interface SearchMatch {
@@ -75,10 +87,13 @@ export interface EditorSettings {
 export interface BuildSettings {
   cxxFlags: string[];
   staticRuntime: boolean;
+  externalConsole: boolean;
 }
 
 export interface AppSettings {
   schemaVersion: number;
   editor: EditorSettings;
   build: BuildSettings;
+  trustedWorkspaces: string[];
+  onboardingCompleted: boolean;
 }

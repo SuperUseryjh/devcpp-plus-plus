@@ -6,6 +6,7 @@ import {
   type ReactNode,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
@@ -28,6 +29,7 @@ import {
   Save,
   Search,
   Settings,
+  ShieldAlert,
   Terminal,
   Trash2,
   TriangleAlert,
@@ -57,11 +59,13 @@ import {
 } from "./lsp/client";
 import type {
   AppSettings,
+  BuildEvent,
   BuildResult,
   FileChangeEvent,
   FileData,
   FileEntry,
   LspInfo,
+  LspStopped,
   SearchMatch,
   ToolchainInfo,
   WorkspaceInfo,
@@ -89,6 +93,27 @@ interface ProblemItem {
 
 type SidebarView = "explorer" | "search" | "problems" | "run" | "settings";
 type PanelTab = "problems" | "output";
+type ResizeDirection =
+  | "East"
+  | "North"
+  | "NorthEast"
+  | "NorthWest"
+  | "South"
+  | "SouthEast"
+  | "SouthWest"
+  | "West";
+
+const RESIZE_HANDLES: Array<{ direction: ResizeDirection; className: string }> = [
+  { direction: "North", className: "north" },
+  { direction: "South", className: "south" },
+  { direction: "East", className: "east" },
+  { direction: "West", className: "west" },
+  { direction: "NorthEast", className: "north-east" },
+  { direction: "NorthWest", className: "north-west" },
+  { direction: "SouthEast", className: "south-east" },
+  { direction: "SouthWest", className: "south-west" },
+];
+
 type PaletteMode = "commands" | "files" | "symbols";
 
 interface TreeContextMenu {
@@ -109,7 +134,10 @@ const DEFAULT_SETTINGS: AppSettings = {
   build: {
     cxxFlags: ["-std=c++20", "-g", "-O0", "-Wall", "-Wextra"],
     staticRuntime: true,
+    externalConsole: false,
   },
+  trustedWorkspaces: [],
+  onboardingCompleted: false,
 };
 
 interface OutlineItem {
@@ -370,6 +398,14 @@ function App() {
   const openTabsRef = useRef<string[]>([]);
   const dirsRef = useRef<Record<string, FileEntry[]>>({});
   const dirtyPathsRef = useRef<Set<string>>(new Set());
+  const buildOutputBufferRef = useRef("");
+  const buildOutputTimerRef = useRef<number | null>(null);
+  const titlebarDragTimerRef = useRef<number | null>(null);
+  const allowCloseRef = useRef(false);
+  const lspRestartTimerRef = useRef<number | null>(null);
+  const lspRestartingRef = useRef(false);
+  const lspCrashTimesRef = useRef<number[]>([]);
+  const scheduleRestartRef = useRef<(reason: string) => void>(() => undefined);
 
   const [root, setRoot] = useState<string | null>(null);
   const [entries, setEntries] = useState<FileEntry[]>([]);
@@ -382,6 +418,8 @@ function App() {
   const [stdinText, setStdinText] = useState("");
   const [problems, setProblems] = useState<ProblemItem[]>([]);
   const [buildProblems, setBuildProblems] = useState<ProblemItem[]>([]);
+  const [building, setBuilding] = useState(false);
+  const [workspaceTrusted, setWorkspaceTrusted] = useState(true);
   const [status, setStatus] = useState("就绪");
   const [lspStatus, setLspStatus] = useState("LSP 未连接");
   const [toolchain, setToolchain] = useState<ToolchainInfo | null>(null);
@@ -421,6 +459,89 @@ function App() {
   const [symbolResults, setSymbolResults] = useState<
     Array<SymbolInformation | WorkspaceSymbol>
   >([]);
+  const [isMaximized, setIsMaximized] = useState(false);
+  const [windowFocused, setWindowFocused] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    let unlistenResize: (() => void) | undefined;
+    let unlistenFocus: (() => void) | undefined;
+    const appWindow = getCurrentWindow();
+    void appWindow
+      .isMaximized()
+      .then((maximized) => {
+        if (active) setIsMaximized(maximized);
+      })
+      .catch(() => undefined);
+    void appWindow
+      .onResized(async () => {
+        try {
+          const maximized = await appWindow.isMaximized();
+          if (active) setIsMaximized(maximized);
+        } catch {
+          // ignore window state errors
+        }
+      })
+      .then((unlisten) => {
+        if (active) unlistenResize = unlisten;
+        else unlisten();
+      });
+    void appWindow
+      .onFocusChanged(({ payload }) => {
+        if (active) setWindowFocused(payload);
+      })
+      .then((unlisten) => {
+        if (active) unlistenFocus = unlisten;
+        else unlisten();
+      });
+    return () => {
+      active = false;
+      unlistenResize?.();
+      unlistenFocus?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow()
+      .onCloseRequested(async (event) => {
+        if (allowCloseRef.current || dirtyPathsRef.current.size === 0) return;
+        event.preventDefault();
+        const close = await confirmDialog(
+          "有未保存的文件，确定关闭 DevCpp++ 吗？",
+          {
+            title: "未保存的文件",
+            kind: "warning",
+            okLabel: "关闭",
+            cancelLabel: "取消",
+          },
+        );
+        if (close) {
+          allowCloseRef.current = true;
+          await getCurrentWindow().close();
+        }
+      })
+      .then((dispose) => {
+        if (active) unlisten = dispose;
+        else dispose();
+      });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const current = currentPath?.split(/[\\/]/).pop();
+    const workspace = root?.split(/[\\/]/).filter(Boolean).pop();
+    const title = current
+      ? current + " — DevCpp++"
+      : workspace
+        ? workspace + " — DevCpp++"
+        : "DevCpp++";
+    void getCurrentWindow().setTitle(title).catch(() => undefined);
+  }, [currentPath, root]);
 
   useEffect(() => {
     rootRef.current = root;
@@ -1236,6 +1357,12 @@ function App() {
   }, []);
 
   useEffect(() => {
+    void invoke<ToolchainInfo>("detect_toolchain")
+      .then((detected) => setToolchain(detected))
+      .catch((error) => console.warn("[toolchain] detect failed", error));
+  }, []);
+
+  useEffect(() => {
     void invoke<AppSettings>("load_settings")
       .then((loaded) => {
         setSettingsDraft(loaded);
@@ -1456,21 +1583,76 @@ function App() {
     }
   }, [settingsDraft, applyEditorSettings]);
 
+  const trustWorkspace = useCallback(async () => {
+    if (!root) return;
+    const next: AppSettings = {
+      ...settings,
+      trustedWorkspaces: [
+        ...settings.trustedWorkspaces.filter(
+          (path) => normalizePath(path) !== normalizePath(root),
+        ),
+        root,
+      ],
+    };
+    try {
+      const saved = await invoke<AppSettings>("save_settings", {
+        settings: next,
+      });
+      setSettings(saved);
+      setSettingsDraft(saved);
+      setWorkspaceTrusted(true);
+      setStatus("工作区已信任，可以构建和运行");
+    } catch (error) {
+      setOutput(String(error));
+      setStatus("保存工作区信任状态失败");
+    }
+  }, [root, settings]);
+
+  const completeOnboarding = useCallback(async () => {
+    if (settings.onboardingCompleted) return;
+    const next = { ...settings, onboardingCompleted: true };
+    try {
+      const saved = await invoke<AppSettings>("save_settings", {
+        settings: next,
+      });
+      setSettings(saved);
+      setSettingsDraft(saved);
+    } catch (error) {
+      console.warn("[settings] save onboarding failed", error);
+    }
+  }, [settings]);
+
   const buildAndRun = useCallback(async () => {
-    if (!root || !currentPath) return;
+    if (!root || !currentPath || building) return;
+    if (!workspaceTrusted) {
+      setOutput(
+        "当前工作区处于受限模式。请先点击编辑区上方的“信任并继续”，再构建或运行。",
+      );
+      setStatus("工作区未信任");
+      setPanelTab("output");
+      setPanelVisible(true);
+      return;
+    }
     const saved = await saveCurrent();
     if (!saved) return;
     setBuildProblems([]);
-    setOutput("编译中...");
+    setOutput("");
     setStatus("编译中...");
+    setBuilding(true);
     try {
-      const result = await invoke<BuildResult>("build_and_run", {
+      const result = await invoke<BuildResult>("build_and_run_stream", {
         root,
         file: currentPath,
         stdin: stdinText,
         cxxFlags: settings.build.cxxFlags,
         staticRuntime: settings.build.staticRuntime,
+        externalConsole: settings.build.externalConsole,
       });
+      if (buildOutputTimerRef.current !== null) {
+        window.clearTimeout(buildOutputTimerRef.current);
+        buildOutputTimerRef.current = null;
+      }
+      buildOutputBufferRef.current = "";
       const diagnostics: ProblemItem[] = (result.diagnostics ?? []).map(
         (diagnostic) => ({
           uri: monaco.Uri.file(diagnostic.path).toString(),
@@ -1490,9 +1672,11 @@ function App() {
       setBuildProblems(diagnostics);
       setOutput(result.output || "(无输出)");
       setStatus(
-        result.success
-          ? `运行结束 · 退出码 ${result.exitCode} · ${result.durationMs} ms`
-          : `构建失败 · 退出码 ${result.exitCode}`,
+        result.cancelled
+          ? "构建已取消"
+          : result.success
+            ? `运行结束 · 退出码 ${result.exitCode} · ${result.durationMs} ms`
+            : `构建失败 · 退出码 ${result.exitCode}`,
       );
       if (!result.success || diagnostics.length > 0) {
         setPanelTab("problems");
@@ -1501,8 +1685,58 @@ function App() {
     } catch (error) {
       setOutput(String(error));
       setStatus("构建失败");
+    } finally {
+      setBuilding(false);
     }
-  }, [root, currentPath, saveCurrent, stdinText, settings.build]);
+  }, [
+    root,
+    currentPath,
+    building,
+    workspaceTrusted,
+    saveCurrent,
+    stdinText,
+    settings.build,
+  ]);
+
+  const cancelBuild = useCallback(async () => {
+    try {
+      await invoke("cancel_build");
+      setStatus("正在取消构建...");
+    } catch (error) {
+      setOutput(String(error));
+    }
+  }, []);
+
+  useEffect(() => {
+    const pending = listen<BuildEvent>("build:event", (event) => {
+      const payload = event.payload;
+      if (payload.kind === "started") {
+        if (buildOutputTimerRef.current !== null) {
+          window.clearTimeout(buildOutputTimerRef.current);
+          buildOutputTimerRef.current = null;
+        }
+        buildOutputBufferRef.current = "";
+        setOutput("");
+        return;
+      }
+      if (payload.kind !== "output" || !payload.text) return;
+      buildOutputBufferRef.current += payload.text;
+      if (buildOutputTimerRef.current !== null) return;
+      buildOutputTimerRef.current = window.setTimeout(() => {
+        const chunk = buildOutputBufferRef.current;
+        buildOutputBufferRef.current = "";
+        buildOutputTimerRef.current = null;
+        if (chunk) setOutput((previous) => previous + chunk);
+      }, 50);
+    });
+    return () => {
+      if (buildOutputTimerRef.current !== null) {
+        window.clearTimeout(buildOutputTimerRef.current);
+        buildOutputTimerRef.current = null;
+      }
+      void pending.then((unlisten) => unlisten());
+    };
+  }, []);
 
   const openCommandPalette = useCallback(() => {
     setMenuOpen(null);
@@ -1599,6 +1833,97 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [buildAndRun, saveCurrent, currentPath, closeTab, openCommandPalette, openQuickOpen, openWorkspaceSymbols]);
 
+  const connectLsp = useCallback(
+    async (workspaceRoot: string, clangdVersion?: string) => {
+      lspRef.current?.dispose();
+      lspRef.current = null;
+      const info = await invoke<LspInfo>("start_lsp", {
+        root: workspaceRoot,
+      });
+      const client = await LspClient.connect(info, workspaceRoot);
+      client.onDiagnostics(handleDiagnostics);
+      lspRef.current = client;
+      setLspStatus(
+        `clangd ${shortVersion(
+          clangdVersion ?? toolchain?.clangdVersion,
+          "已连接",
+        )}`,
+      );
+      return client;
+    },
+    [handleDiagnostics, toolchain?.clangdVersion],
+  );
+
+  const scheduleLspRestart = useCallback(
+    (reason: string) => {
+      if (!rootRef.current || lspRestartingRef.current) return;
+      const now = Date.now();
+      const recent = lspCrashTimesRef.current.filter(
+        (time) => now - time < 60_000,
+      );
+      recent.push(now);
+      lspCrashTimesRef.current = recent;
+      if (recent.length > 3) {
+        setLspStatus("clangd 多次退出，自动重启已暂停");
+        setOutput(
+          `${reason}
+
+clangd 在 60 秒内连续退出超过 3 次，已停止自动重启。请检查 clangd 日志或手动重启。`,
+        );
+        return;
+      }
+      const delay = Math.min(500 * 2 ** (recent.length - 1), 8000);
+      setLspStatus(
+        `clangd 已退出，${delay} ms 后重试（${recent.length}/3）`,
+      );
+      setOutput(`${reason}
+
+${delay} ms 后自动重启 clangd...`);
+      lspRestartingRef.current = true;
+      lspRestartTimerRef.current = window.setTimeout(async () => {
+        lspRestartTimerRef.current = null;
+        lspRestartingRef.current = false;
+        const activeRoot = rootRef.current;
+        if (!activeRoot) return;
+        try {
+          await connectLsp(activeRoot);
+          setStatus("clangd 已自动恢复");
+        } catch (error) {
+          setOutput(String(error));
+          scheduleRestartRef.current(reason);
+        }
+      }, delay);
+    },
+    [connectLsp],
+  );
+
+  useEffect(() => {
+    scheduleRestartRef.current = scheduleLspRestart;
+  }, [scheduleLspRestart]);
+
+  useEffect(() => {
+    return () => {
+      if (lspRestartTimerRef.current !== null) {
+        window.clearTimeout(lspRestartTimerRef.current);
+        lspRestartTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const pending = listen<LspStopped>("lsp:stopped", (event) => {
+      if (event.payload.intentional) {
+        lspCrashTimesRef.current = [];
+        lspRestartingRef.current = false;
+        return;
+      }
+      scheduleLspRestart(event.payload.reason);
+    });
+    return () => {
+      void pending.then((unlisten) => unlisten());
+    };
+  }, [scheduleLspRestart]);
+
   const openWorkspace = useCallback(
     async (selected: string) => {
       if (dirtyPaths.size > 0) {
@@ -1614,6 +1939,12 @@ function App() {
         if (!shouldSave) return;
         if (!(await saveAllDocuments())) return;
       }
+      if (lspRestartTimerRef.current !== null) {
+        window.clearTimeout(lspRestartTimerRef.current);
+        lspRestartTimerRef.current = null;
+      }
+      lspRestartingRef.current = false;
+      lspCrashTimesRef.current = [];
       void invoke("unwatch_workspace").catch(() => undefined);
       editorRef.current?.setModel(null);
       for (const doc of docsRef.current.values()) {
@@ -1627,6 +1958,13 @@ function App() {
       }
 
       setRoot(selected);
+      const trusted = settings.trustedWorkspaces.some(
+        (path) => normalizePath(path) === normalizePath(selected),
+      );
+      setWorkspaceTrusted(trusted);
+      if (!settings.onboardingCompleted) {
+        void completeOnboarding();
+      }
       rememberRecent(selected);
       setCurrentPath(null);
       setOpenTabs([]);
@@ -1662,19 +2000,13 @@ function App() {
         );
 
         try {
-          const lspInfo = await invoke<LspInfo>("start_lsp", {
-            root: selected,
-          });
-          const client = await LspClient.connect(lspInfo, selected);
-          client.onDiagnostics(handleDiagnostics);
-          lspRef.current = client;
-          setLspStatus(
-            `clangd ${shortVersion(detected.clangdVersion, "已连接")}`,
-          );
+          await connectLsp(selected, detected.clangdVersion);
         } catch (error) {
           setLspStatus("clangd 不可用");
           setOutput(
-            `${String(error)}\n\n提示：设置 DEVCPP_CLANGD 或把 clangd.exe 放到 tools/clangd/bin/。`,
+            `${String(error)}
+
+提示：设置 DEVCPP_CLANGD 或把 clangd.exe 放到 tools/clangd/bin/。`,
           );
         }
 
@@ -1714,7 +2046,16 @@ function App() {
         setOutput(String(error));
       }
     },
-    [dirtyPaths, handleDiagnostics, openFile, rememberRecent, saveAllDocuments],
+    [
+      connectLsp,
+      dirtyPaths,
+      openFile,
+      rememberRecent,
+      saveAllDocuments,
+      settings.trustedWorkspaces,
+      settings.onboardingCompleted,
+      completeOnboarding,
+    ],
   );
 
   const openFolder = useCallback(async () => {
@@ -1826,12 +2167,12 @@ function App() {
         (raw) => {
           const name = raw.trim();
           if (!name) return;
-          if (name.includes("..") || /^[\/]/.test(name)) {
+          if (name.includes("..") || /^[\\/]/.test(name)) {
             setStatus("名称不能包含 .. 或绝对路径");
             return;
           }
           const separator = base.includes("\\") ? "\\" : "/";
-          const target = `${base.replace(/[\/]+$/, "")}${separator}${name}`;
+          const target = `${base.replace(/[\\/]+$/, "")}${separator}${name}`;
           void (async () => {
             try {
               await invoke(
@@ -1866,7 +2207,7 @@ function App() {
       askText("重命名", oldName, (raw) => {
         const newName = raw.trim();
         if (!newName || newName === oldName) return;
-        if (newName.includes("..") || /[\/]/.test(newName)) {
+        if (newName.includes("..") || /[\\/]/.test(newName)) {
           setStatus("名称不能包含路径分隔符");
           return;
         }
@@ -1952,22 +2293,24 @@ function App() {
 
   const restartLsp = useCallback(async () => {
     if (!root) return;
+    if (lspRestartTimerRef.current !== null) {
+      window.clearTimeout(lspRestartTimerRef.current);
+      lspRestartTimerRef.current = null;
+    }
+    lspRestartingRef.current = false;
+    lspCrashTimesRef.current = [];
     setLspStatus("clangd 重启中...");
     lspRef.current?.dispose();
     lspRef.current = null;
     try {
       await invoke("stop_lsp");
-      const info = await invoke<LspInfo>("start_lsp", { root });
-      const client = await LspClient.connect(info, root);
-      client.onDiagnostics(handleDiagnostics);
-      lspRef.current = client;
-      setLspStatus(`clangd ${shortVersion(toolchain?.clangdVersion, "已连接")}`);
+      await connectLsp(root, toolchain?.clangdVersion);
       setStatus("clangd 已重启");
     } catch (error) {
       setLspStatus("clangd 不可用");
       setOutput(String(error));
     }
-  }, [root, toolchain?.clangdVersion, handleDiagnostics]);
+  }, [root, toolchain?.clangdVersion, connectLsp]);
 
   const showPanel = useCallback((tab: PanelTab) => {
     setPanelTab(tab);
@@ -2450,12 +2793,21 @@ function App() {
             <button
               type="button"
               className="side-button primary"
-              disabled={!currentPath}
+              disabled={!currentPath || building || !workspaceTrusted}
               onClick={() => void buildAndRun()}
             >
-              <Play size={15} /> 编译并运行
+              <Play size={15} /> {building ? "构建中..." : "编译并运行"}
               <kbd>F11</kbd>
             </button>
+            {building ? (
+              <button
+                type="button"
+                className="side-button danger"
+                onClick={() => void cancelBuild()}
+              >
+                <X size={15} /> 取消构建
+              </button>
+            ) : null}
             <button
               type="button"
               className="side-button"
@@ -2624,6 +2976,25 @@ function App() {
                 }
               />
             </label>
+            <label className="setting-row">
+              <span className="setting-label">外部控制台</span>
+              <input
+                type="checkbox"
+                checked={settingsDraft.build.externalConsole}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    build: {
+                      ...previous.build,
+                      externalConsole: event.target.checked,
+                    },
+                  }))
+                }
+              />
+            </label>
+            <div className="side-note">
+              外部控制台适合需要交互输入的程序；关闭时使用输出面板和 stdin 文本框。
+            </div>
             <button
               type="button"
               className="side-button primary"
@@ -2770,16 +3141,97 @@ function App() {
   ) {
     breadcrumbPath = breadcrumbPath.slice(root.length);
   }
+  const minimizeWindow = useCallback(() => {
+    void getCurrentWindow().minimize().catch(() => undefined);
+  }, []);
+
+  const toggleMaximizeWindow = useCallback(async () => {
+    const appWindow = getCurrentWindow();
+    try {
+      if (isMaximized) {
+        await appWindow.unmaximize();
+      } else {
+        await appWindow.maximize();
+      }
+      setIsMaximized(await appWindow.isMaximized());
+    } catch {
+      // ignore window state errors
+    }
+  }, [isMaximized]);
+
+  const closeWindow = useCallback(() => {
+    void getCurrentWindow().close().catch(() => undefined);
+  }, []);
+
+  const clearTitlebarDragTimer = useCallback(() => {
+    if (titlebarDragTimerRef.current !== null) {
+      window.clearTimeout(titlebarDragTimerRef.current);
+      titlebarDragTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (titlebarDragTimerRef.current !== null) {
+        window.clearTimeout(titlebarDragTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleTitlebarMouseDown = useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      if (event.button !== 0) return;
+      const target = event.target as HTMLElement;
+      if (target.closest("button, a, input, select, textarea, label")) return;
+      clearTitlebarDragTimer();
+      titlebarDragTimerRef.current = window.setTimeout(() => {
+        titlebarDragTimerRef.current = null;
+        void getCurrentWindow()
+          .startDragging()
+          .catch((error) => setStatus(`拖动窗口失败: ${String(error)}`));
+      }, 180);
+    },
+    [clearTitlebarDragTimer],
+  );
+
+  const handleTitlebarDoubleClick = useCallback(
+    (event: React.MouseEvent<HTMLElement>) => {
+      const target = event.target as HTMLElement;
+      if (target.closest("button, a, input, select, textarea, label")) return;
+      clearTitlebarDragTimer();
+      void toggleMaximizeWindow();
+    },
+    [clearTitlebarDragTimer, toggleMaximizeWindow],
+  );
+
+  const beginResize = useCallback((direction: ResizeDirection) => {
+    void getCurrentWindow()
+      .startResizeDragging(direction)
+      .catch(() => undefined);
+  }, []);
+
   const breadcrumbParts = breadcrumbPath
     .split(/[\\/]/)
     .filter(Boolean);
 
   return (
-    <div className="app">
-      <div
-        className="menubar"
+    <div className={`app${isMaximized ? " maximized" : ""}`}>
+      <header
+        className={`titlebar${windowFocused ? " focused" : ""}`}
+        onMouseDown={handleTitlebarMouseDown}
+        onMouseUp={clearTitlebarDragTimer}
+        onDoubleClick={handleTitlebarDoubleClick}
         onPointerDown={(event) => event.stopPropagation()}
       >
+        <div className="titlebar-brand" title="DevCpp++">
+          <img
+            className="titlebar-logo"
+            src="/logo.svg"
+            alt=""
+            draggable={false}
+          />
+          <span className="titlebar-title">DevCpp++</span>
+        </div>
         <div className="menu-group">
           {menuDefs.map((menu) => (
             <div className="menu" key={menu.id}>
@@ -2807,7 +3259,7 @@ function App() {
                         onClick={() => runCommand(id)}
                       >
                         <span>
-                          {command.label.replace(/^[^:]+:\s*/, "")}
+                          {command.label.replace(/^[^:]+:s*/, "")}
                         </span>
                         {command.keybinding ? (
                           <span className="menu-shortcut">
@@ -2831,10 +3283,55 @@ function App() {
           <span>搜索或运行命令</span>
           <span className="command-center-hint">Ctrl+Shift+P</span>
         </button>
-        <div className="menubar-right">
-          <span className="p0-badge">P0</span>
+        <div className="titlebar-drag-fill" />
+        <div className="window-controls">
+          <button
+            type="button"
+            className="window-control"
+            title="最小化"
+            aria-label="最小化"
+            onClick={minimizeWindow}
+          >
+            <span className="window-glyph minimize" />
+          </button>
+          <button
+            type="button"
+            className="window-control"
+            title={isMaximized ? "还原" : "最大化"}
+            aria-label={isMaximized ? "还原" : "最大化"}
+            onClick={() => void toggleMaximizeWindow()}
+          >
+            <span
+              className={`window-glyph ${
+                isMaximized ? "restore" : "maximize"
+              }`}
+            />
+          </button>
+          <button
+            type="button"
+            className="window-control close"
+            title="关闭"
+            aria-label="关闭"
+            onClick={closeWindow}
+          >
+            <X size={15} />
+          </button>
         </div>
-      </div>
+      </header>
+
+      {!isMaximized
+        ? RESIZE_HANDLES.map((handle) => (
+            <div
+              key={handle.direction}
+              className={`resize-handle ${handle.className}`}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                beginResize(handle.direction);
+              }}
+            />
+          ))
+        : null}
 
       <div className="main">
         <nav className="activitybar">
@@ -2953,6 +3450,25 @@ function App() {
             </div>
           ) : null}
 
+          {root && !workspaceTrusted ? (
+            <div className="trust-banner">
+              <ShieldAlert size={16} className="trust-icon" />
+              <div className="trust-copy">
+                <strong>受限模式</strong>
+                <span>
+                  此工作区尚未信任。构建和运行已禁用，编辑与浏览仍可用。
+                </span>
+              </div>
+              <button
+                type="button"
+                className="trust-button"
+                onClick={() => void trustWorkspace()}
+              >
+                信任并继续
+              </button>
+            </div>
+          ) : null}
+
           <div className="editor-container">
             <div className="editor-host" ref={editorHostRef} />
             {openTabs.length === 0 ? (
@@ -2984,6 +3500,40 @@ function App() {
                     <Hammer size={16} /> CMake 示例
                   </button>
                 </div>
+                {!root && !settings.onboardingCompleted ? (
+                  <div className="onboarding-card">
+                    <div className="onboarding-title">首次使用 · 环境检查</div>
+                    <div className="onboarding-grid">
+                      {[
+                        ["g++", toolchain?.gxxVersion],
+                        ["clangd", toolchain?.clangdVersion],
+                        ["CMake", toolchain?.cmakeVersion],
+                        ["Ninja", toolchain?.ninjaVersion],
+                      ].map(([label, version]) => (
+                        <div className="onboarding-row" key={label}>
+                          <span>{label}</span>
+                          <span className={version ? "ok" : "missing"}>
+                            {version
+                              ? shortVersion(version, "已检测")
+                              : "未检测到"}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="onboarding-hint">
+                      缺少 clangd / CMake / Ninja 时，可运行
+                      <code>scripts/fetch-toolchain.ps1</code>
+                      下载到 tools/，或安装 LLVM、CMake、Ninja。
+                    </div>
+                    <button
+                      type="button"
+                      className="onboarding-skip"
+                      onClick={() => void completeOnboarding()}
+                    >
+                      跳过引导
+                    </button>
+                  </div>
+                ) : null}
                 {recent.length > 0 ? (
                   <div className="welcome-recent">
                     <div className="welcome-recent-title">最近</div>

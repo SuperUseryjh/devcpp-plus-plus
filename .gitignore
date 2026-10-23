@@ -33,3 +33,6 @@ examples/*/.devcpp/
 *.msi
 
 examples/*/.devcpp/
+
+# pi agent runtime
+.pi/
