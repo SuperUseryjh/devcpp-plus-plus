@@ -147,7 +147,7 @@ interface ProblemItem {
 }
 
 type SidebarView = "explorer" | "search" | "problems" | "run" | "settings";
-type PanelTab = "problems" | "output" | "terminal";
+type PanelTab = "problems" | "output" | "terminal" | "debug";
 type ResizeDirection =
   | "East"
   | "North"
@@ -497,6 +497,11 @@ function App() {
     Array<{ expression: string; value: string; type?: string }>
   >([]);
   const [watchExpression, setWatchExpression] = useState("");
+  const [debugConsoleInput, setDebugConsoleInput] = useState("");
+  const [exceptionFilters, setExceptionFilters] = useState<Set<string>>(
+    new Set(),
+  );
+  const exceptionFiltersRef = useRef<Set<string>>(new Set());
   const [debugLog, setDebugLog] = useState("");
   const [debugError, setDebugError] = useState("");
 
@@ -2114,6 +2119,62 @@ function App() {
     [refreshDebugView, stopDebug],
   );
 
+  const syncExceptionBreakpoints = useCallback(async (filters: Set<string>) => {
+    const dap = dapRef.current;
+    if (!dap) return;
+    try {
+      await dap.request("setExceptionBreakpoints", {
+        filters: Array.from(filters),
+      });
+    } catch (error) {
+      setDebugError(String(error));
+    }
+  }, []);
+
+  const toggleExceptionFilter = useCallback(
+    (filter: string) => {
+      const next = new Set(exceptionFiltersRef.current);
+      if (next.has(filter)) next.delete(filter);
+      else next.add(filter);
+      exceptionFiltersRef.current = next;
+      setExceptionFilters(next);
+      void syncExceptionBreakpoints(next);
+    },
+    [syncExceptionBreakpoints],
+  );
+
+  const evaluateDebugExpression = useCallback(async () => {
+    const expression = debugConsoleInput.trim();
+    if (!expression) return;
+    setDebugConsoleInput("");
+    setDebugLog((previous) => previous + String.fromCharCode(10) + "> " + expression + String.fromCharCode(10));
+    const dap = dapRef.current;
+    if (!dap) {
+      setDebugLog((previous) => previous + "调试器未启动" + String.fromCharCode(10));
+      return;
+    }
+    try {
+      const result = await dap.request<{ result?: string; type?: string }>(
+        "evaluate",
+        {
+          expression,
+          frameId: debugFrames[0]?.id,
+          context: "repl",
+        },
+      );
+      setDebugLog(
+        (previous) =>
+          previous +
+          (result.result ?? "(无结果)") +
+          String.fromCharCode(10),
+      );
+    } catch (error) {
+      setDebugLog(
+        (previous) => previous + String(error) + String.fromCharCode(10),
+      );
+    }
+  }, [debugConsoleInput, debugFrames]);
+
   const startDebug = useCallback(async () => {
     if (!root || !currentPath || building) return;
     if (!workspaceTrusted) {
@@ -2171,6 +2232,9 @@ function App() {
           }),
         });
       }
+      await dap.request("setExceptionBreakpoints", {
+        filters: Array.from(exceptionFiltersRef.current),
+      });
       const launch = dap.request("launch", {
         program: result.executable,
         cwd: root,
@@ -3588,6 +3652,23 @@ ${delay} ms 后自动重启 clangd...`);
               <Play size={15} /> 编译并调试
               <kbd>F5</kbd>
             </button>
+            <div className="settings-title">异常断点</div>
+            <div className="debug-exceptions">
+              {[
+                ["throw", "C++ throw"],
+                ["rethrow", "C++ rethrow"],
+                ["catch", "C++ catch"],
+              ].map(([filter, label]) => (
+                <label key={filter}>
+                  <input
+                    type="checkbox"
+                    checked={exceptionFilters.has(filter)}
+                    onChange={() => toggleExceptionFilter(filter)}
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
             <div className="settings-title">断点</div>
             {breakpointRows.length === 0 ? (
               <div className="side-note">暂无断点；点击行号左侧空白或按 F9 添加。</div>
@@ -4584,7 +4665,11 @@ ${delay} ms 后自动重启 clangd...`);
               >
                 <Terminal size={13} /> 终端
               </button>
-              <button type="button" className="panel-tab" disabled>
+              <button
+                type="button"
+                className={`panel-tab${panelTab === "debug" ? " active" : ""}`}
+                onClick={() => setPanelTab("debug")}
+              >
                 调试控制台
               </button>
             </div>
@@ -4608,7 +4693,25 @@ ${delay} ms 后自动重启 clangd...`);
             </div>
           </div>
           <div className="panel-content">
-            {panelTab === "terminal" ? (
+            {panelTab === "debug" ? (
+              <div className="debug-console-wrap">
+                <pre className="debug-console-output">
+                  {debugLog || "调试输出与表达式结果会显示在这里"}
+                </pre>
+                <div className="debug-console-input">
+                  <span>›</span>
+                  <input
+                    value={debugConsoleInput}
+                    onChange={(event) => setDebugConsoleInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") void evaluateDebugExpression();
+                    }}
+                    placeholder="输入表达式，例如 values.size()"
+                    spellCheck={false}
+                  />
+                </div>
+              </div>
+            ) : panelTab === "terminal" ? (
               <TerminalView root={root} />
             ) : panelTab === "problems" ? (
               renderProblemList()
