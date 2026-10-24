@@ -1136,7 +1136,7 @@ Rust 用 `thiserror` 定义，序列化为 camelCase；前端按 `code` 本地�
 - 语义高亮（视 P0/P1 spike 结果）；
 - 项目向导（控制台项目）；
 - 构建错误解析到 Problems；
-- 自动更新；
+- 自动更新（按用户决定后置到 1.0.1）；
 - 外部控制台 helper（按回车退出）✅
 
 ### 8.3 P2（v0.3+）——进阶
@@ -1571,7 +1571,7 @@ LLVM 安装包较大（约 1–2 GB），但包含 clangd/clang-format/clang-tid
 
 ### 14.7 P0 后的下一步
 
-- 当前：M5 已完成；M6 已接入 gdb DAP 基础调试与 ConPTY + xterm 集成终端。后续：条件断点/附加/监视表达式、终端分屏/多会话、英文 UI、自动更新与性能裁剪。
+- 当前：M5 已完成；M6 已接入 gdb DAP 基础调试（含监视）与 ConPTY + xterm 集成终端。后续：条件断点/附加/异常断点、终端分屏/多会话、性能裁剪；英文 UI 与自动更新按用户决定后置到 1.0.1。
 - 若 P0 通过：冻结 MVP 范围，进入 M1；
 - 若 LSP 桥不稳定：改用 Tauri IPC transport，或评估 `vscode-ws-jsonrpc` 的 reader/writer；
 - 若 GCC + 中文路径不可接受：默认构建目录放 ASCII 缓存，保留 GCC；调试/Unicode 场景推荐 LLVM；
