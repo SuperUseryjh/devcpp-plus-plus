@@ -38,6 +38,7 @@ use uuid::Uuid;
 #[derive(Default)]
 struct AppState {
     lsp: Mutex<Option<LspHandle>>,
+    dap: Mutex<Option<DapHandle>>,
     watcher: StdMutex<Option<RecommendedWatcher>>,
     build_cancel: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -45,6 +46,10 @@ struct AppState {
 struct LspHandle {
     shutdown: oneshot::Sender<()>,
     intentional: Arc<AtomicBool>,
+}
+
+struct DapHandle {
+    shutdown: oneshot::Sender<()>,
 }
 
 #[derive(Clone, Serialize)]
@@ -100,6 +105,20 @@ struct LspInfo {
     token: String,
     clangd_path: String,
     gxx_path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DapInfo {
+    port: u16,
+    token: String,
+    gdb_path: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DapStopped {
+    reason: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -713,7 +732,7 @@ fn save_settings(app: AppHandle, settings: AppSettings) -> Result<AppSettings, S
 #[tauri::command]
 fn detect_toolchain() -> ToolchainInfo {
     let gxx = find_gxx();
-    let gdb = find_tool("gdb");
+    let gdb = find_gdb();
     let clangd = find_clangd();
     let cmake = find_cmake();
     let ninja = find_ninja();
@@ -876,6 +895,199 @@ async fn stop_lsp(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn start_dap(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    root: String,
+) -> Result<DapInfo, String> {
+    let root = normalize_existing_dir(&root)?;
+    if let Some(old) = state.dap.lock().await.take() {
+        let _ = old.shutdown.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    let (info, handle) = start_dap_session(&root, Some(app)).await?;
+    *state.dap.lock().await = Some(handle);
+    Ok(info)
+}
+
+async fn start_dap_session(
+    root: &Path,
+    app: Option<AppHandle>,
+) -> Result<(DapInfo, DapHandle), String> {
+    let gdb = find_gdb().ok_or_else(|| {
+        "未找到可用的 gdb.exe。请安装 MinGW-w64 GDB 14+，或设置 DEVCPP_GDB".to_string()
+    })?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .map_err(|e| format!("无法监听调试端口: {}", e))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("获取调试端口失败: {}", e))?
+        .port();
+    let token = format!(
+        "{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+
+    let mut cmd = TokioCommand::new(&gdb);
+    cmd.arg("--interpreter=dap")
+        .arg("--quiet")
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(gxx) = find_gxx() {
+        if let Some(path) = path_with_prefix(gxx.parent()) {
+            cmd.env("PATH", path);
+        }
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("启动 gdb DAP 失败: {}", e))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "无法获取 gdb stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法获取 gdb stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法获取 gdb stderr".to_string())?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let token_for_bridge = token.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_dap_bridge(
+            listener,
+            token_for_bridge,
+            stdin,
+            stdout,
+            stderr,
+            child,
+            app,
+            shutdown_rx,
+        )
+        .await
+        {
+            eprintln!("[dap] bridge stopped: {}", err);
+        }
+    });
+    Ok((
+        DapInfo {
+            port,
+            token,
+            gdb_path: gdb.display().to_string(),
+        },
+        DapHandle {
+            shutdown: shutdown_tx,
+        },
+    ))
+}
+
+#[tauri::command]
+async fn stop_dap(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(handle) = state.dap.lock().await.take() {
+        let _ = handle.shutdown.send(());
+    }
+    Ok(())
+}
+
+async fn run_dap_bridge(
+    listener: TcpListener,
+    token: String,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    mut child: Child,
+    app: Option<AppHandle>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let (stream, _) = listener
+        .accept()
+        .await
+        .map_err(|e| format!("接受调试 WebSocket 连接失败: {}", e))?;
+    let ws = accept_hdr_async(stream, move |request: &Request, response: Response| {
+        authorize(request, response, &token)
+    })
+    .await
+    .map_err(|e| format!("调试 WebSocket 握手失败: {}", e))?;
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let mut stdin = stdin;
+    let mut stdout = BufReader::new(stdout);
+    let log_app = app.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(app) = &log_app {
+                let _ = app.emit("dap:log", line);
+            } else {
+                eprintln!("[gdb] {}", line);
+            }
+        }
+    });
+
+    let stop_reason: String;
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => {
+                stop_reason = "调试已停止".to_string();
+                break;
+            }
+            status = child.wait() => {
+                stop_reason = match status {
+                    Ok(status) => format!("gdb 已退出: {}", status),
+                    Err(err) => format!("等待 gdb 退出失败: {}", err),
+                };
+                break;
+            }
+            incoming = ws_rx.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        write_lsp(&mut stdin, text.as_str()).await?;
+                    }
+                    Some(Ok(Message::Binary(_))) => {}
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = ws_tx.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        stop_reason = "调试 WebSocket 已断开".to_string();
+                        break;
+                    }
+                    Some(Err(err)) => return Err(format!("调试 WebSocket 读取失败: {}", err)),
+                    _ => {}
+                }
+            }
+            outgoing = read_lsp(&mut stdout) => {
+                match outgoing {
+                    Ok(Some(body)) => {
+                        ws_tx
+                            .send(Message::text(body))
+                            .await
+                            .map_err(|e| format!("发送调试消息失败: {}", e))?;
+                    }
+                    Ok(None) => {
+                        stop_reason = "gdb 输出已关闭".to_string();
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    }
+    let _ = child.kill().await;
+    if let Some(app) = &app {
+        let _ = app.emit("dap:stopped", DapStopped { reason: stop_reason });
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn build_and_run(
     root: String,
     file: String,
@@ -892,6 +1104,7 @@ async fn build_and_run(
         None,
         None,
         false,
+        true,
     )
     .await
 }
@@ -906,6 +1119,7 @@ async fn build_and_run_stream(
     cxx_flags: Option<Vec<String>>,
     static_runtime: Option<bool>,
     external_console: Option<bool>,
+    run: Option<bool>,
 ) -> Result<BuildResult, String> {
     let settings = load_settings(app.clone())?;
     let normalized_root = normalize_path_for_compare(Path::new(&root));
@@ -927,6 +1141,7 @@ async fn build_and_run_stream(
         Some(app),
         Some(cancel_rx),
         external_console.unwrap_or(false),
+        run.unwrap_or(true),
     )
     .await;
     *state.build_cancel.lock().await = None;
@@ -950,6 +1165,7 @@ async fn build_and_run_core(
     app: Option<AppHandle>,
     cancel: Option<oneshot::Receiver<()>>,
     external_console: bool,
+    should_run: bool,
 ) -> Result<BuildResult, String> {
     let root = normalize_existing_dir(&root)?;
     let file = PathBuf::from(file);
@@ -965,6 +1181,7 @@ async fn build_and_run_core(
             app,
             cancel,
             external_console,
+            should_run,
         )
         .await;
     }
@@ -1040,6 +1257,18 @@ async fn build_and_run_core(
             output,
             exit_code: compile_status.code().unwrap_or(-1),
             executable: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+            diagnostics,
+            cancelled: false,
+        });
+    }
+
+    if !should_run {
+        return Ok(BuildResult {
+            success: true,
+            output,
+            exit_code: 0,
+            executable: Some(exe.display().to_string()),
             duration_ms: start.elapsed().as_millis() as u64,
             diagnostics,
             cancelled: false,
@@ -1172,6 +1401,7 @@ async fn build_and_run_cmake(
     app: Option<AppHandle>,
     cancel: Option<oneshot::Receiver<()>>,
     external_console: bool,
+    should_run: bool,
 ) -> Result<BuildResult, String> {
     let start = Instant::now();
     let gxx = find_gxx().ok_or_else(|| "未找到 g++.exe，请检查 PATH".to_string())?;
@@ -1249,6 +1479,18 @@ async fn build_and_run_cmake(
             build_dir.display()
         )
     })?;
+    if !should_run {
+        return Ok(BuildResult {
+            success: true,
+            output,
+            exit_code: 0,
+            executable: Some(exe.display().to_string()),
+            duration_ms: start.elapsed().as_millis() as u64,
+            diagnostics,
+            cancelled: false,
+        });
+    }
+
     let executed = run_program(&exe, root, &gxx, stdin, external_console).await?;
     output.push_str("\n--- 程序输出 ---\n");
     output.push_str(&decode_output(&executed.stdout));
@@ -1808,6 +2050,27 @@ fn find_tool(name: &str) -> Option<PathBuf> {
         .or_else(|| which::which(format!("{}.exe", name)).ok())
 }
 
+fn find_gdb() -> Option<PathBuf> {
+    if let Ok(value) = std::env::var("DEVCPP_GDB") {
+        let path = PathBuf::from(value);
+        if path.is_file() && version_of(&path).is_some() {
+            return Some(path);
+        }
+    }
+    let common = PathBuf::from("C:/ProgramData/mingw64/mingw64/bin/gdb.exe");
+    if common.is_file() && version_of(&common).is_some() {
+        return Some(common);
+    }
+    let mut candidates = Vec::new();
+    if let Ok(paths) = which::which_all("gdb.exe") {
+        candidates.extend(paths);
+    }
+    if let Ok(paths) = which::which_all("gdb") {
+        candidates.extend(paths);
+    }
+    candidates.into_iter().find(|path| path.is_file() && version_of(path).is_some())
+}
+
 fn version_of(exe: &Path) -> Option<String> {
     let mut command = std::process::Command::new(exe);
     command.arg("--version");
@@ -2088,6 +2351,8 @@ pub fn run() {
             cmake_example_workspace,
             start_lsp,
             stop_lsp,
+            start_dap,
+            stop_dap,
             build_and_run,
             build_and_run_stream,
             cancel_build,

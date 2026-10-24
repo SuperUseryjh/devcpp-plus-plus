@@ -12,6 +12,7 @@ import { confirm as confirmDialog, open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   CircleAlert,
   Command,
   FileCode2,
@@ -57,10 +58,18 @@ import {
   type WorkspaceEdit,
   type WorkspaceSymbol,
 } from "./lsp/client";
+import {
+  DapClient,
+  waitForDapEvent,
+  type DapEvent,
+  type DapStackFrame,
+  type DapVariable,
+} from "./debug/dap";
 import type {
   AppSettings,
   BuildEvent,
   BuildResult,
+  DapInfo,
   FileChangeEvent,
   FileData,
   FileEntry,
@@ -436,6 +445,10 @@ function App() {
   const outputRef = useRef<HTMLPreElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const lspRef = useRef<LspClient | null>(null);
+  const dapRef = useRef<DapClient | null>(null);
+  const breakpointsRef = useRef<Map<string, Set<number>>>(new Map());
+  const breakpointDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
+  const debugLineDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
   const docsRef = useRef(new Map<string, OpenedDoc>());
   const autoOpenedRef = useRef(false);
   const rootRef = useRef<string | null>(null);
@@ -466,6 +479,45 @@ function App() {
   const [problems, setProblems] = useState<ProblemItem[]>([]);
   const [buildProblems, setBuildProblems] = useState<ProblemItem[]>([]);
   const [building, setBuilding] = useState(false);
+  const [breakpointVersion, setBreakpointVersion] = useState(0);
+  const [debugPhase, setDebugPhase] = useState<
+    "idle" | "starting" | "running" | "stopped"
+  >("idle");
+  const [debugThreadId, setDebugThreadId] = useState<number | null>(null);
+  const [debugFrames, setDebugFrames] = useState<DapStackFrame[]>([]);
+  const [debugVariables, setDebugVariables] = useState<DapVariable[]>([]);
+  const [debugLog, setDebugLog] = useState("");
+  const [debugError, setDebugError] = useState("");
+
+  const toggleBreakpoint = useCallback((path: string, line: number) => {
+    const key = normalizePath(path);
+    const current = new Set(breakpointsRef.current.get(key) ?? []);
+    if (current.has(line)) current.delete(line);
+    else current.add(line);
+    if (current.size === 0) breakpointsRef.current.delete(key);
+    else breakpointsRef.current.set(key, current);
+    setBreakpointVersion((value) => value + 1);
+  }, []);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) return;
+    const path = uriToPath(model.uri.toString());
+    const lines = Array.from(
+      breakpointsRef.current.get(normalizePath(path)) ?? [],
+    ).sort((a, b) => a - b);
+    breakpointDecorationsRef.current?.clear();
+    breakpointDecorationsRef.current = editor.createDecorationsCollection(
+      lines.map((line) => ({
+        range: new monaco.Range(line, 1, line, 1),
+        options: {
+          glyphMarginClassName: "breakpoint-glyph",
+          glyphMarginHoverMessage: { value: `断点 · 第 ${line} 行` },
+        },
+      })),
+    );
+  }, [breakpointVersion, currentPath]);
   const [workspaceTrusted, setWorkspaceTrusted] = useState(true);
   const [status, setStatus] = useState("就绪");
   const [lspStatus, setLspStatus] = useState("LSP 未连接");
@@ -558,7 +610,15 @@ function App() {
     let unlisten: (() => void) | undefined;
     void getCurrentWindow()
       .onCloseRequested(async (event) => {
-        if (allowCloseRef.current || dirtyPathsRef.current.size === 0) return;
+        const stopChildren = async () => {
+          await invoke("stop_dap").catch(() => undefined);
+          await invoke("stop_lsp").catch(() => undefined);
+        };
+        if (allowCloseRef.current) return;
+        if (dirtyPathsRef.current.size === 0) {
+          await stopChildren();
+          return;
+        }
         event.preventDefault();
         const close = await confirmDialog(
           "有未保存的文件，确定关闭 DevCpp++ 吗？",
@@ -571,6 +631,7 @@ function App() {
         );
         if (close) {
           allowCloseRef.current = true;
+          await stopChildren();
           await getCurrentWindow().close();
         }
       })
@@ -949,6 +1010,7 @@ function App() {
       bracketPairColorization: { enabled: true },
       guides: { indentation: true, bracketPairs: true },
       tabSize: 4,
+      glyphMargin: true,
     });
     editorRef.current = editor;
 
@@ -957,6 +1019,18 @@ function App() {
         line: event.position.lineNumber,
         column: event.position.column,
       });
+    });
+
+    const glyphSubscription = editor.onMouseDown((event) => {
+      if (
+        event.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN
+      ) {
+        return;
+      }
+      const line = event.target.position?.lineNumber;
+      const model = editor.getModel();
+      if (!line || !model) return;
+      toggleBreakpoint(uriToPath(model.uri.toString()), line);
     });
 
     const contentSubscription = editor.onDidChangeModelContent(() => {
@@ -1421,6 +1495,7 @@ function App() {
 
     return () => {
       cursorSubscription.dispose();
+      glyphSubscription.dispose();
       contentSubscription.dispose();
       completions.dispose();
       hovers.dispose();
@@ -1803,6 +1878,217 @@ function App() {
     }
   }, []);
 
+  const resetDebugUi = useCallback(() => {
+    debugLineDecorationsRef.current?.clear();
+    debugLineDecorationsRef.current = null;
+    setDebugPhase("idle");
+    setDebugThreadId(null);
+    setDebugFrames([]);
+    setDebugVariables([]);
+    setDebugError("");
+  }, []);
+
+  const stopDebug = useCallback(async () => {
+    const dap = dapRef.current;
+    dapRef.current = null;
+    if (dap) {
+      try {
+        await dap.request("disconnect", { terminateDebuggee: true });
+      } catch {
+        // The debuggee may already have exited.
+      }
+      dap.dispose();
+    }
+    try {
+      await invoke("stop_dap");
+    } catch {
+      // Ignore an already-stopped backend.
+    }
+    resetDebugUi();
+    setStatus("调试已停止");
+  }, [resetDebugUi]);
+
+  const refreshDebugView = useCallback(
+    async (dap: DapClient, threadId: number) => {
+      const stack = await dap.request<{
+        stackFrames?: DapStackFrame[];
+      }>("stackTrace", { threadId });
+      const frames = stack.stackFrames ?? [];
+      setDebugFrames(frames);
+      const top = frames[0];
+      if (!top) {
+        setDebugVariables([]);
+        return;
+      }
+      const sourcePath = top.source?.path;
+      if (sourcePath && top.line > 0) {
+        if (normalizePath(sourcePath) !== normalizePath(currentPathRef.current ?? "")) {
+          await openFile(sourcePath);
+        }
+        const editor = editorRef.current;
+        const model = editor?.getModel();
+        if (editor && model) {
+          editor.revealLineInCenter(top.line);
+          debugLineDecorationsRef.current?.clear();
+          debugLineDecorationsRef.current =
+            editor.createDecorationsCollection([
+              {
+                range: new monaco.Range(top.line, 1, top.line, 1),
+                options: {
+                  isWholeLine: true,
+                  className: "debug-current-line",
+                  glyphMarginClassName: "debug-current-arrow",
+                },
+              },
+            ]);
+        }
+      }
+      const scopes = await dap.request<{
+        scopes?: Array<{ name: string; variablesReference: number }>;
+      }>("scopes", { frameId: top.id });
+      const scope = (scopes.scopes ?? []).find(
+        (item) => item.variablesReference > 0,
+      );
+      if (!scope) {
+        setDebugVariables([]);
+        return;
+      }
+      const variables = await dap.request<{
+        variables?: DapVariable[];
+      }>("variables", { variablesReference: scope.variablesReference });
+      setDebugVariables(variables.variables ?? []);
+    },
+    [openFile],
+  );
+
+  const handleDapEvent = useCallback(
+    (event: DapEvent) => {
+      if (event.event === "stopped") {
+        const threadId = Number(event.body?.threadId ?? 1);
+        setDebugThreadId(threadId);
+        setDebugPhase("stopped");
+        setStatus("调试暂停");
+        const dap = dapRef.current;
+        if (dap) void refreshDebugView(dap, threadId);
+        return;
+      }
+      if (event.event === "continued") {
+        setDebugPhase("running");
+        setStatus("调试运行中");
+        debugLineDecorationsRef.current?.clear();
+        return;
+      }
+      if (event.event === "output") {
+        const text = String(event.body?.output ?? "");
+        if (text) {
+          setDebugLog((previous) =>
+            (previous + text).slice(-200_000),
+          );
+        }
+        return;
+      }
+      if (event.event === "terminated" || event.event === "exited") {
+        void stopDebug();
+      }
+    },
+    [refreshDebugView, stopDebug],
+  );
+
+  const startDebug = useCallback(async () => {
+    if (!root || !currentPath || building) return;
+    if (!workspaceTrusted) {
+      setStatus("工作区未信任");
+      return;
+    }
+    if (!(await saveCurrent())) return;
+    await stopDebug();
+    setDebugError("");
+    setDebugLog("");
+    setDebugPhase("starting");
+    setStatus("编译调试版本...");
+    setBuilding(true);
+    try {
+      const result = await invoke<BuildResult>("build_and_run_stream", {
+        root,
+        file: currentPath,
+        stdin: stdinText,
+        cxxFlags: settings.build.cxxFlags,
+        staticRuntime: settings.build.staticRuntime,
+        externalConsole: false,
+        run: false,
+      });
+      if (!result.success || !result.executable) {
+        setDebugError(result.output || "构建失败");
+        resetDebugUi();
+        setStatus("调试构建失败");
+        return;
+      }
+      setOutput(result.output || "");
+      const info = await invoke<DapInfo>("start_dap", { root });
+      const dap = await DapClient.connect(info);
+      dapRef.current = dap;
+      dap.onEvent(handleDapEvent);
+      const initialized = waitForDapEvent(dap, "initialized");
+      await dap.request("initialize", {
+        clientID: "devcpp-plus-plus",
+        clientName: "DevCpp++",
+        adapterID: "gdb",
+        pathFormat: "path",
+        linesStartAt1: true,
+        columnsStartAt1: true,
+        supportsVariableType: true,
+        supportsRunInTerminalRequest: false,
+      });
+      await initialized;
+      for (const [path, lines] of breakpointsRef.current) {
+        await dap.request("setBreakpoints", {
+          source: { path },
+          breakpoints: Array.from(lines).map((line) => ({ line })),
+        });
+      }
+      const launch = dap.request("launch", {
+        program: result.executable,
+        cwd: root,
+        args: [],
+        stopOnEntry: false,
+      });
+      await dap.request("configurationDone", {});
+      await launch;
+      setDebugPhase("running");
+      setStatus("调试运行中");
+    } catch (error) {
+      setDebugError(String(error));
+      await stopDebug();
+      setStatus("启动调试失败");
+    } finally {
+      setBuilding(false);
+    }
+  }, [
+    root,
+    currentPath,
+    building,
+    workspaceTrusted,
+    saveCurrent,
+    stopDebug,
+    stdinText,
+    settings.build,
+    handleDapEvent,
+    resetDebugUi,
+  ]);
+
+  const debugCommand = useCallback(
+    async (command: string, args: Record<string, unknown> = {}) => {
+      const dap = dapRef.current;
+      if (!dap) return;
+      try {
+        await dap.request(command, args);
+      } catch (error) {
+        setDebugError(String(error));
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     const pending = listen<BuildEvent>("build:event", (event) => {
       const payload = event.payload;
@@ -1912,9 +2198,40 @@ function App() {
         setMenuOpen(null);
         return;
       }
+      if (event.key === "F5") {
+        event.preventDefault();
+        if (event.shiftKey) {
+          void stopDebug();
+        } else if (debugPhase === "stopped") {
+          void debugCommand("continue", { threadId: debugThreadId ?? 1 });
+        } else {
+          void startDebug();
+        }
+        return;
+      }
+      if (event.key === "F9") {
+        const editor = editorRef.current;
+        const model = editor?.getModel();
+        const position = editor?.getPosition();
+        if (editor && model && position) {
+          event.preventDefault();
+          toggleBreakpoint(uriToPath(model.uri.toString()), position.lineNumber);
+        }
+        return;
+      }
+      if (event.key === "F10" && debugPhase === "stopped") {
+        event.preventDefault();
+        void debugCommand("next", { threadId: debugThreadId ?? 1 });
+        return;
+      }
       if (event.key === "F11") {
         event.preventDefault();
-        void buildAndRun();
+        if (debugPhase === "stopped") {
+          void debugCommand("stepIn", { threadId: debugThreadId ?? 1 });
+        } else {
+          void buildAndRun();
+        }
+        return;
       }
       if (ctrl && key === "s") {
         event.preventDefault();
@@ -1927,7 +2244,21 @@ function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [buildAndRun, saveCurrent, currentPath, closeTab, openCommandPalette, openQuickOpen, openWorkspaceSymbols]);
+  }, [
+    buildAndRun,
+    saveCurrent,
+    currentPath,
+    closeTab,
+    openCommandPalette,
+    openQuickOpen,
+    openWorkspaceSymbols,
+    startDebug,
+    stopDebug,
+    debugCommand,
+    debugPhase,
+    debugThreadId,
+    toggleBreakpoint,
+  ]);
 
   const connectLsp = useCallback(
     async (workspaceRoot: string, clangdVersion?: string) => {
@@ -2717,6 +3048,31 @@ ${delay} ms 后自动重启 clangd...`);
       run: () => void buildAndRun(),
     },
     {
+      id: "run.debug",
+      label: "运行: 编译并调试",
+      keybinding: "F5",
+      run: () => void startDebug(),
+    },
+    {
+      id: "debug.breakpoint",
+      label: "调试: 切换当前行断点",
+      keybinding: "F9",
+      run: () => {
+        const editor = editorRef.current;
+        const model = editor?.getModel();
+        const position = editor?.getPosition();
+        if (editor && model && position) {
+          toggleBreakpoint(uriToPath(model.uri.toString()), position.lineNumber);
+        }
+      },
+    },
+    {
+      id: "debug.stop",
+      label: "调试: 停止",
+      keybinding: "Shift+F5",
+      run: () => void stopDebug(),
+    },
+    {
       id: "run.format",
       label: "运行: 格式化当前文件",
       keybinding: "Shift+Alt+F",
@@ -2781,7 +3137,7 @@ ${delay} ms 后自动重启 clangd...`);
     {
       id: "run",
       label: "运行",
-      items: ["run.build", "run.format"],
+      items: ["run.build", "run.debug", "debug.breakpoint", "debug.stop", "run.format"],
     },
     {
       id: "help",
@@ -3072,6 +3428,15 @@ ${delay} ms 后自动重启 clangd...`);
             <button
               type="button"
               className="side-button"
+              disabled={!currentPath || building || !workspaceTrusted}
+              onClick={() => void startDebug()}
+            >
+              <Play size={15} /> 编译并调试
+              <kbd>F5</kbd>
+            </button>
+            <button
+              type="button"
+              className="side-button"
               disabled={!currentPath}
               onClick={() => void saveCurrent()}
             >
@@ -3101,8 +3466,129 @@ ${delay} ms 后自动重启 clangd...`);
                 ? currentPath.split(/[\\/]/).pop()
                 : "未打开文件"}
             </div>
+            {debugPhase !== "idle" ? (
+              <div className="debug-section">
+                <div className="settings-title">调试</div>
+                <div className="debug-toolbar">
+                  <button
+                    type="button"
+                    className="side-button"
+                    disabled={debugPhase !== "stopped"}
+                    onClick={() =>
+                      void debugCommand("continue", {
+                        threadId: debugThreadId ?? 1,
+                      })
+                    }
+                  >
+                    <Play size={14} /> 继续
+                  </button>
+                  <button
+                    type="button"
+                    className="side-button"
+                    disabled={debugPhase !== "stopped"}
+                    onClick={() =>
+                      void debugCommand("next", {
+                        threadId: debugThreadId ?? 1,
+                      })
+                    }
+                  >
+                    <ChevronRight size={14} /> 单步
+                  </button>
+                  <button
+                    type="button"
+                    className="side-button"
+                    disabled={debugPhase !== "stopped"}
+                    onClick={() =>
+                      void debugCommand("stepIn", {
+                        threadId: debugThreadId ?? 1,
+                      })
+                    }
+                  >
+                    <ChevronDown size={14} /> 步入
+                  </button>
+                  <button
+                    type="button"
+                    className="side-button"
+                    disabled={debugPhase !== "stopped"}
+                    onClick={() =>
+                      void debugCommand("stepOut", {
+                        threadId: debugThreadId ?? 1,
+                      })
+                    }
+                  >
+                    <ChevronUp size={14} /> 步出
+                  </button>
+                  <button
+                    type="button"
+                    className="side-button danger"
+                    onClick={() => void stopDebug()}
+                  >
+                    <X size={14} /> 停止
+                  </button>
+                </div>
+                <div className="side-meta">
+                  {debugPhase === "starting"
+                    ? "正在启动调试..."
+                    : debugPhase === "running"
+                      ? "运行中"
+                      : "已暂停"}
+                </div>
+                {debugError ? <pre className="debug-error">{debugError}</pre> : null}
+                {debugFrames.length > 0 ? (
+                  <>
+                    <div className="settings-title">调用栈</div>
+                    {debugFrames.map((frame) => (
+                      <button
+                        key={frame.id}
+                        type="button"
+                        className="debug-frame"
+                        title={frame.source?.path}
+                        onClick={() => {
+                          if (frame.source?.path) {
+                            void openFile(frame.source.path).then(() => {
+                              editorRef.current?.revealLineInCenter(
+                                Math.max(frame.line, 1),
+                              );
+                            });
+                          }
+                        }}
+                      >
+                        <span>{frame.name}</span>
+                        <span className="debug-frame-location">
+                          {frame.source?.name ?? ""}
+                          {frame.line > 0 ? ":" + frame.line : ""}
+                        </span>
+                      </button>
+                    ))}
+                  </>
+                ) : null}
+                {debugVariables.length > 0 ? (
+                  <>
+                    <div className="settings-title">变量</div>
+                    <div className="debug-variables">
+                      {debugVariables.map((variable) => (
+                        <div className="debug-variable" key={variable.name}>
+                          <span className="debug-variable-name">
+                            {variable.name}
+                          </span>
+                          <span className="debug-variable-value">
+                            {variable.value}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+                {debugLog ? (
+                  <>
+                    <div className="settings-title">调试输出</div>
+                    <pre className="debug-log">{debugLog}</pre>
+                  </>
+                ) : null}
+              </div>
+            ) : null}
             <div className="side-note">
-              调试器尚未接入；当前支持编译运行与 stdin。
+              编译并调试使用 gdb DAP；点击行号左侧空白添加断点，F5 调试，F9 断点。
             </div>
           </div>
         </>

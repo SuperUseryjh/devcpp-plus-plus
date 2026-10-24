@@ -29,6 +29,12 @@ export interface ToolchainInfo {
   ninjaVersion?: string;
 }
 
+export interface DapInfo {
+  port: number;
+  token: string;
+  gdbPath: string;
+}
+
 export interface LspInfo {
   port: number;
   token: string;
