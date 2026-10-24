@@ -2560,7 +2560,7 @@ ${delay} ms 后自动重启 clangd...`);
   const about = useCallback(() => {
     setOutput(
       [
-        "DevCpp++ 0.1.0 (P0)",
+        "DevCpp++ 0.2.0 (M5)",
         "",
         "Tauri 2 + React + Monaco Editor + clangd + GCC",
         "计划书: PLAN.md",

@@ -1,6 +1,6 @@
 [package]
 name = "devcpp-plus-plus"
-version = "0.1.0"
+version = "0.2.0"
 description = "A lightweight modern C++ IDE"
 authors = ["devcpp-plus-plus contributors"]
 edition = "2024"

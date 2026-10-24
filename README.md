@@ -1,13 +1,13 @@
 # DevCpp++
 
-轻量化、现代化、Windows 优先的 C++ IDE（MVP 硬化版）。
+轻量化、现代化、Windows 优先的 C++ IDE（v0.2 M5 体验补齐版）。
 
 技术栈：**Tauri 2 + React + Monaco Editor + clangd + GCC (MinGW-w64)**
 
-> 当前状态：MVP 硬化收尾；品牌图标、无边框窗口、clangd 自恢复、流式构建/取消、首次引导与工作区信任已接入。
+> 当前状态：v0.2.0 / M5；品牌图标、无边框窗口、clangd 自恢复与实时诊断、流式构建/取消、首次引导与工作区信任、文件树拖拽、项目向导、语义高亮与外部控制台 helper 已接入。
 > 完整计划见 [`PLAN.md`](./PLAN.md)。
 
-## 已实现（P0 + M1/M2/P1 部分）
+## 已实现（P0 + M1/M2/M3/M4 + M5 P1）
 
 - 原创 D++ Logo 与全套应用图标（标题栏 / exe / NSIS）
 - 无边框一体化窗口 + 自定义标题栏，Windows 11 圆角，保留拖动/缩放/Snap/最小化/最大化/关闭
@@ -74,7 +74,7 @@ npm run tauri build -- --debug --no-bundle
 
 ```powershell
 npm run tauri build -- --bundles nsis
-# 产物：src-tauri\target\release\bundle\nsis\DevCpp++_0.1.0_x64-setup.exe
+# 产物：src-tauri\target\release\bundle\nsis\DevCpp++_0.2.0_x64-setup.exe
 ```
 
 构建实测：安装包约 **4.9 MiB**，应用 exe 约 **8 MiB**。
@@ -139,7 +139,6 @@ tools/ninja/         本地 Ninja（git 忽略）
 - 没有调试器、集成终端、Git
 - CMake 模式为基础实现：单 target、自动选择一个 exe；多 target/运行目标选择后续完善
 - 英文 UI、自动更新尚未完成
-- 文件树拖拽移动已支持（拖到文件夹或工作区根路径）
 - Monaco 目前全量引入，前端产物约 4 MB gzip 1.1 MB，后续按需裁剪
 - clangd 使用 `--background-index`，大项目索引会占用 CPU/内存
 - 中文输入法（IME）组合输入仍需人工回归测试

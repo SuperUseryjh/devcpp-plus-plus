@@ -338,7 +338,7 @@ export class LspClient {
       capabilities?: unknown;
     }>("initialize", {
       processId: null,
-      clientInfo: { name: "DevCpp++", version: "0.1.0" },
+      clientInfo: { name: "DevCpp++", version: "0.2.0" },
       rootUri: this.rootUri,
       workspaceFolders: [
         { uri: this.rootUri, name: this.workspaceName },
