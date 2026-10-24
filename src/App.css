@@ -1938,3 +1938,25 @@ textarea:focus-visible {
   gap: 6px;
   cursor: pointer;
 }
+
+.debug-threads {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.debug-thread {
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #cccccc;
+  padding: 3px 6px;
+  text-align: left;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.debug-thread:hover,
+.debug-thread.active {
+  background: var(--selection);
+}

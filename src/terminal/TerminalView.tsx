@@ -5,7 +5,13 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 
-export function TerminalView({ root }: { root: string | null }) {
+export function TerminalView({
+  root,
+  shell,
+}: {
+  root: string | null;
+  shell: string;
+}) {
   const hostRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -59,7 +65,7 @@ export function TerminalView({ root }: { root: string | null }) {
         unlisteners.push(...dispose);
       }
     });
-    void invoke("start_terminal", { root })
+    void invoke("start_terminal", { root, shell })
       .then(() => {
         fitAndResize();
         term.focus();
@@ -75,7 +81,7 @@ export function TerminalView({ root }: { root: string | null }) {
       void invoke("stop_terminal").catch(() => undefined);
       term.dispose();
     };
-  }, [root]);
+  }, [root, shell]);
 
   return <div className="terminal-host" ref={hostRef} />;
 }

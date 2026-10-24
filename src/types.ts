@@ -102,4 +102,5 @@ export interface AppSettings {
   build: BuildSettings;
   trustedWorkspaces: string[];
   onboardingCompleted: boolean;
+  terminalShell: string;
 }

@@ -345,6 +345,8 @@ struct AppSettings {
     trusted_workspaces: Vec<String>,
     #[serde(default)]
     onboarding_completed: bool,
+    #[serde(default = "default_terminal_shell")]
+    terminal_shell: String,
 }
 
 impl Default for AppSettings {
@@ -355,8 +357,13 @@ impl Default for AppSettings {
             build: BuildSettings::default(),
             trusted_workspaces: Vec::new(),
             onboarding_completed: false,
+            terminal_shell: default_terminal_shell(),
         }
     }
+}
+
+fn default_terminal_shell() -> String {
+    "cmd".to_string()
 }
 
 #[tauri::command]
@@ -1100,6 +1107,7 @@ async fn start_terminal(
     app: AppHandle,
     state: State<'_, AppState>,
     root: Option<String>,
+    shell: Option<String>,
 ) -> Result<(), String> {
     if let Some(mut old) = state.terminal.lock().await.take() {
         let _ = old.child.kill();
@@ -1116,11 +1124,23 @@ async fn start_terminal(
             pixel_height: 0,
         })
         .map_err(|e| format!("创建终端失败: {}", e))?;
-    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-    let mut command = CommandBuilder::new(shell);
-    command.arg("/Q");
-    command.arg("/K");
-    command.arg("chcp 65001>nul");
+    let shell_kind = shell.unwrap_or_else(|| "cmd".to_string());
+    let mut command = if shell_kind.eq_ignore_ascii_case("powershell") {
+        let mut command = CommandBuilder::new("powershell.exe");
+        command.arg("-NoLogo");
+        command.arg("-NoProfile");
+        command.arg("-NoExit");
+        command.arg("-Command");
+        command.arg("[Console]::OutputEncoding=[Text.Encoding]::UTF8");
+        command
+    } else {
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        let mut command = CommandBuilder::new(shell);
+        command.arg("/Q");
+        command.arg("/K");
+        command.arg("chcp 65001>nul");
+        command
+    };
     if let Some(cwd) = cwd.as_ref() {
         command.cwd(cwd);
     }

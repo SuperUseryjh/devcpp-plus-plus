@@ -193,6 +193,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   },
   trustedWorkspaces: [],
   onboardingCompleted: false,
+  terminalShell: "cmd",
 };
 
 interface OutlineItem {
@@ -490,6 +491,9 @@ function App() {
   const [debugThreadId, setDebugThreadId] = useState<number | null>(null);
   const [debugFrames, setDebugFrames] = useState<DapStackFrame[]>([]);
   const [debugVariables, setDebugVariables] = useState<DapVariable[]>([]);
+  const [debugThreads, setDebugThreads] = useState<Array<{ id: number; name: string }>>(
+    [],
+  );
   const [debugWatches, setDebugWatches] = useState<
     Array<{ expression: string; value: string; type?: string }>
   >([]);
@@ -498,6 +502,9 @@ function App() {
   >([]);
   const [watchExpression, setWatchExpression] = useState("");
   const [debugConsoleInput, setDebugConsoleInput] = useState("");
+  const [functionBreakpoints, setFunctionBreakpoints] = useState<string[]>([]);
+  const functionBreakpointsRef = useRef<string[]>([]);
+  const [functionBreakpointInput, setFunctionBreakpointInput] = useState("");
   const [exceptionFilters, setExceptionFilters] = useState<Set<string>>(
     new Set(),
   );
@@ -1950,6 +1957,7 @@ function App() {
     setDebugThreadId(null);
     setDebugFrames([]);
     setDebugVariables([]);
+    setDebugThreads([]);
     setDebugWatches([]);
     debugWatchesRef.current = [];
     setDebugError("");
@@ -1977,6 +1985,10 @@ function App() {
 
   const refreshDebugView = useCallback(
     async (dap: DapClient, threadId: number) => {
+      const threadsResult = await dap.request<{
+        threads?: Array<{ id: number; name: string }>;
+      }>("threads", {});
+      setDebugThreads(threadsResult.threads ?? []);
       const stack = await dap.request<{
         stackFrames?: DapStackFrame[];
       }>("stackTrace", { threadId });
@@ -2119,10 +2131,45 @@ function App() {
     [refreshDebugView, stopDebug],
   );
 
+  const syncFunctionBreakpoints = useCallback(async (breakpoints: string[]) => {
+    const dap = dapRef.current;
+    if (!dap) return;
+    try {
+      await dap.request("setFunctionBreakpoints", {
+        breakpoints: breakpoints.map((name) => ({ name })),
+      });
+    } catch (error) {
+      setDebugError(String(error));
+    }
+  }, []);
+
+  const addFunctionBreakpoint = useCallback(() => {
+    const name = functionBreakpointInput.trim();
+    if (!name) return;
+    const next = Array.from(new Set([...functionBreakpointsRef.current, name]));
+    functionBreakpointsRef.current = next;
+    setFunctionBreakpoints(next);
+    setFunctionBreakpointInput("");
+    void syncFunctionBreakpoints(next);
+  }, [functionBreakpointInput, syncFunctionBreakpoints]);
+
+  const removeFunctionBreakpoint = useCallback(
+    (name: string) => {
+      const next = functionBreakpointsRef.current.filter((item) => item !== name);
+      functionBreakpointsRef.current = next;
+      setFunctionBreakpoints(next);
+      void syncFunctionBreakpoints(next);
+    },
+    [syncFunctionBreakpoints],
+  );
+
   const syncExceptionBreakpoints = useCallback(async (filters: Set<string>) => {
     const dap = dapRef.current;
     if (!dap) return;
     try {
+      await dap.request("setFunctionBreakpoints", {
+        breakpoints: functionBreakpointsRef.current.map((name) => ({ name })),
+      });
       await dap.request("setExceptionBreakpoints", {
         filters: Array.from(filters),
       });
@@ -2264,6 +2311,62 @@ function App() {
     handleDapEvent,
     resetDebugUi,
   ]);
+
+  const attachDebug = useCallback(
+    async (pid: number) => {
+      if (!root || !workspaceTrusted || !Number.isFinite(pid) || pid <= 0) return;
+      await stopDebug();
+      setDebugError("");
+      setDebugLog("");
+      setDebugPhase("starting");
+      setStatus(`附加到进程 ${pid}...`);
+      try {
+        const info = await invoke<DapInfo>("start_dap", { root });
+        const dap = await DapClient.connect(info);
+        dapRef.current = dap;
+        dap.onEvent(handleDapEvent);
+        const initialized = waitForDapEvent(dap, "initialized");
+        await dap.request("initialize", {
+          clientID: "devcpp-plus-plus",
+          clientName: "DevCpp++",
+          adapterID: "gdb",
+          pathFormat: "path",
+          linesStartAt1: true,
+          columnsStartAt1: true,
+          supportsVariableType: true,
+          supportsRunInTerminalRequest: false,
+        });
+        await initialized;
+        for (const [path, lines] of breakpointsRef.current) {
+          await dap.request("setBreakpoints", {
+            source: { path },
+            breakpoints: Array.from(lines).map((line) => {
+              const condition = breakpointConditionsRef.current
+                .get(path)
+                ?.get(line);
+              return condition ? { line, condition } : { line };
+            }),
+          });
+        }
+        await dap.request("setFunctionBreakpoints", {
+          breakpoints: functionBreakpointsRef.current.map((name) => ({ name })),
+        });
+        await dap.request("setExceptionBreakpoints", {
+          filters: Array.from(exceptionFiltersRef.current),
+        });
+        const attach = dap.request("attach", { processId: pid });
+        await dap.request("configurationDone", {});
+        await attach;
+        setDebugPhase("running");
+        setStatus(`已附加到进程 ${pid}`);
+      } catch (error) {
+        setDebugError(String(error));
+        await stopDebug();
+        setStatus("附加调试失败");
+      }
+    },
+    [root, workspaceTrusted, stopDebug, handleDapEvent],
+  );
 
   const debugCommand = useCallback(
     async (command: string, args: Record<string, unknown> = {}) => {
@@ -3258,6 +3361,15 @@ ${delay} ms 后自动重启 clangd...`);
       run: () => void startDebug(),
     },
     {
+      id: "debug.attach",
+      label: "调试: 附加到进程...",
+      run: () =>
+        askText("附加到进程", "", (value) => {
+          const pid = Number(value.trim());
+          if (Number.isFinite(pid) && pid > 0) void attachDebug(pid);
+        }),
+    },
+    {
       id: "debug.breakpoint",
       label: "调试: 切换当前行断点",
       keybinding: "F9",
@@ -3342,7 +3454,7 @@ ${delay} ms 后自动重启 clangd...`);
     {
       id: "run",
       label: "运行",
-      items: ["run.build", "run.debug", "debug.breakpoint", "debug.stop", "run.format"],
+      items: ["run.build", "run.debug", "debug.attach", "debug.breakpoint", "debug.stop", "run.format"],
     },
     {
       id: "help",
@@ -3652,6 +3764,52 @@ ${delay} ms 后自动重启 clangd...`);
               <Play size={15} /> 编译并调试
               <kbd>F5</kbd>
             </button>
+            <button
+              type="button"
+              className="side-button"
+              disabled={!root || !workspaceTrusted}
+              onClick={() =>
+                askText("附加到进程", "", (value) => {
+                  const pid = Number(value.trim());
+                  if (Number.isFinite(pid) && pid > 0) void attachDebug(pid);
+                })
+              }
+            >
+              附加进程...
+            </button>
+            <div className="settings-title">函数断点</div>
+            <div className="debug-watch-add">
+              <input
+                value={functionBreakpointInput}
+                onChange={(event) => setFunctionBreakpointInput(event.target.value)}
+                placeholder="函数名，例如 main / foo(int)"
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") addFunctionBreakpoint();
+                }}
+              />
+              <button
+                type="button"
+                className="side-button"
+                onClick={() => addFunctionBreakpoint()}
+              >
+                +
+              </button>
+            </div>
+            {functionBreakpoints.map((name) => (
+              <div className="breakpoint-row" key={name}>
+                <span className="breakpoint-location" title={name}>
+                  {name}
+                </span>
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={() => removeFunctionBreakpoint(name)}
+                  title="删除函数断点"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
             <div className="settings-title">异常断点</div>
             <div className="debug-exceptions">
               {[
@@ -3806,6 +3964,29 @@ ${delay} ms 后自动重启 clangd...`);
                       ? "运行中"
                       : "已暂停"}
                 </div>
+                {debugThreads.length > 0 ? (
+                  <>
+                    <div className="settings-title">线程</div>
+                    <div className="debug-threads">
+                      {debugThreads.map((thread) => (
+                        <button
+                          key={thread.id}
+                          type="button"
+                          className={`debug-thread${
+                            debugThreadId === thread.id ? " active" : ""
+                          }`}
+                          onClick={() => {
+                            setDebugThreadId(thread.id);
+                            const dap = dapRef.current;
+                            if (dap) void refreshDebugView(dap, thread.id);
+                          }}
+                        >
+                          #{thread.id} {thread.name}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
                 {debugError ? <pre className="debug-error">{debugError}</pre> : null}
                 {debugFrames.length > 0 ? (
                   <>
@@ -4038,6 +4219,23 @@ ${delay} ms 后自动重启 clangd...`);
                   }))
                 }
               />
+            </label>
+            <div className="settings-title">终端</div>
+            <label className="setting-row">
+              <span className="setting-label">Shell</span>
+              <select
+                className="setting-input"
+                value={settingsDraft.terminalShell}
+                onChange={(event) =>
+                  setSettingsDraft((previous) => ({
+                    ...previous,
+                    terminalShell: event.target.value,
+                  }))
+                }
+              >
+                <option value="cmd">cmd.exe</option>
+                <option value="powershell">PowerShell</option>
+              </select>
             </label>
             <div className="side-note">
               外部控制台适合需要交互输入的程序；关闭时使用输出面板和 stdin 文本框。
@@ -4712,7 +4910,7 @@ ${delay} ms 后自动重启 clangd...`);
                 </div>
               </div>
             ) : panelTab === "terminal" ? (
-              <TerminalView root={root} />
+              <TerminalView root={root} shell={settings.terminalShell} />
             ) : panelTab === "problems" ? (
               renderProblemList()
             ) : (
