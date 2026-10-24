@@ -487,6 +487,13 @@ function App() {
   const [debugThreadId, setDebugThreadId] = useState<number | null>(null);
   const [debugFrames, setDebugFrames] = useState<DapStackFrame[]>([]);
   const [debugVariables, setDebugVariables] = useState<DapVariable[]>([]);
+  const [debugWatches, setDebugWatches] = useState<
+    Array<{ expression: string; value: string; type?: string }>
+  >([]);
+  const debugWatchesRef = useRef<
+    Array<{ expression: string; value: string; type?: string }>
+  >([]);
+  const [watchExpression, setWatchExpression] = useState("");
   const [debugLog, setDebugLog] = useState("");
   const [debugError, setDebugError] = useState("");
 
@@ -1887,6 +1894,8 @@ function App() {
     setDebugThreadId(null);
     setDebugFrames([]);
     setDebugVariables([]);
+    setDebugWatches([]);
+    debugWatchesRef.current = [];
     setDebugError("");
   }, []);
 
@@ -1959,9 +1968,67 @@ function App() {
         variables?: DapVariable[];
       }>("variables", { variablesReference: scope.variablesReference });
       setDebugVariables(variables.variables ?? []);
+      if (debugWatchesRef.current.length > 0) {
+        const evaluated = await Promise.all(
+          debugWatchesRef.current.map(async (watch) => {
+            try {
+              const result = await dap.request<{
+                result?: string;
+                type?: string;
+              }>("evaluate", {
+                expression: watch.expression,
+                frameId: top.id,
+                context: "watch",
+              });
+              return {
+                ...watch,
+                value: result.result ?? "",
+                type: result.type,
+              };
+            } catch (error) {
+              return { ...watch, value: String(error) };
+            }
+          }),
+        );
+        debugWatchesRef.current = evaluated;
+        setDebugWatches(evaluated);
+      }
     },
     [openFile],
   );
+
+  const addWatchExpression = useCallback(async () => {
+    const expression = watchExpression.trim();
+    const dap = dapRef.current;
+    const frame = debugFrames[0];
+    if (!expression || !dap || !frame || debugPhase !== "stopped") return;
+    const item = { expression, value: "…", type: undefined };
+    const next = [...debugWatchesRef.current, item];
+    debugWatchesRef.current = next;
+    setDebugWatches(next);
+    setWatchExpression("");
+    try {
+      const result = await dap.request<{ result?: string; type?: string }>(
+        "evaluate",
+        { expression, frameId: frame.id, context: "watch" },
+      );
+      const updated = next.map((watch) =>
+        watch.expression === expression
+          ? { ...watch, value: result.result ?? "", type: result.type }
+          : watch,
+      );
+      debugWatchesRef.current = updated;
+      setDebugWatches(updated);
+    } catch (error) {
+      const updated = next.map((watch) =>
+        watch.expression === expression
+          ? { ...watch, value: String(error) }
+          : watch,
+      );
+      debugWatchesRef.current = updated;
+      setDebugWatches(updated);
+    }
+  }, [watchExpression, debugFrames, debugPhase]);
 
   const handleDapEvent = useCallback(
     (event: DapEvent) => {
@@ -2193,6 +2260,12 @@ function App() {
       if (ctrl && key === "j") {
         event.preventDefault();
         setPanelVisible((visible) => !visible);
+        return;
+      }
+      if (ctrl && event.key === "`") {
+        event.preventDefault();
+        setPanelTab("terminal");
+        setPanelVisible(true);
         return;
       }
       if (event.key === "Escape") {
@@ -3021,6 +3094,15 @@ ${delay} ms 后自动重启 clangd...`);
       },
     },
     {
+      id: "view.terminal",
+      label: "查看: 集成终端",
+      keybinding: "Ctrl+`",
+      run: () => {
+        setPanelTab("terminal");
+        setPanelVisible(true);
+      },
+    },
+    {
       id: "view.output",
       label: "查看: 输出",
       run: () => showPanel("output"),
@@ -3126,6 +3208,7 @@ ${delay} ms 后自动重启 clangd...`);
         "view.search",
         "view.problems",
         "view.output",
+        "view.terminal",
         "view.palette",
         "view.toggleSidebar",
         "view.togglePanel",
@@ -3581,6 +3664,33 @@ ${delay} ms 后自动重启 clangd...`);
                     </div>
                   </>
                 ) : null}
+                <div className="settings-title">监视</div>
+                <div className="debug-watch-add">
+                  <input
+                    value={watchExpression}
+                    onChange={(event) => setWatchExpression(event.target.value)}
+                    placeholder="输入表达式，例如 values.size()"
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") void addWatchExpression();
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="side-button"
+                    disabled={debugPhase !== "stopped"}
+                    onClick={() => void addWatchExpression()}
+                  >
+                    +
+                  </button>
+                </div>
+                {debugWatches.map((watch) => (
+                  <div className="debug-variable" key={watch.expression}>
+                    <span className="debug-variable-name">{watch.expression}</span>
+                    <span className="debug-variable-value" title={watch.type}>
+                      {watch.value}
+                    </span>
+                  </div>
+                ))}
                 {debugLog ? (
                   <>
                     <div className="settings-title">调试输出</div>

@@ -1817,3 +1817,26 @@ textarea:focus-visible {
 .terminal-host .xterm-viewport {
   overflow-y: auto;
 }
+
+.debug-watch-add {
+  display: flex;
+  gap: 4px;
+}
+
+.debug-watch-add input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid #3c3c3c;
+  border-radius: 3px;
+  background: #1e1e1e;
+  color: #cccccc;
+  padding: 3px 6px;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 11px;
+}
+
+.debug-watch-add .side-button {
+  width: auto;
+  flex: none;
+  padding: 2px 8px;
+}
