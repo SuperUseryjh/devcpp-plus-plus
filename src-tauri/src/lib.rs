@@ -14,6 +14,7 @@ use std::{
 use encoding_rs::{GBK, UTF_16BE, UTF_16LE, UTF_8};
 use futures_util::{SinkExt, StreamExt};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use portable_pty::{native_pty_system, Child as PtyChild, CommandBuilder, MasterPty, PtySize};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -39,6 +40,7 @@ use uuid::Uuid;
 struct AppState {
     lsp: Mutex<Option<LspHandle>>,
     dap: Mutex<Option<DapHandle>>,
+    terminal: Mutex<Option<TerminalHandle>>,
     watcher: StdMutex<Option<RecommendedWatcher>>,
     build_cancel: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -50,6 +52,12 @@ struct LspHandle {
 
 struct DapHandle {
     shutdown: oneshot::Sender<()>,
+}
+
+struct TerminalHandle {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    child: Box<dyn PtyChild + Send>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1083,6 +1091,117 @@ async fn run_dap_bridge(
     let _ = child.kill().await;
     if let Some(app) = &app {
         let _ = app.emit("dap:stopped", DapStopped { reason: stop_reason });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_terminal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    root: Option<String>,
+) -> Result<(), String> {
+    if let Some(mut old) = state.terminal.lock().await.take() {
+        let _ = old.child.kill();
+    }
+    let cwd = match root {
+        Some(root) => Some(normalize_existing_dir(&root)?),
+        None => None,
+    };
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("创建终端失败: {}", e))?;
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let mut command = CommandBuilder::new(shell);
+    command.arg("/Q");
+    command.arg("/K");
+    command.arg("chcp 65001>nul");
+    if let Some(cwd) = cwd.as_ref() {
+        command.cwd(cwd);
+    }
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|e| format!("启动终端 shell 失败: {}", e))?;
+    drop(pair.slave);
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("读取终端失败: {}", e))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("写入终端失败: {}", e))?;
+    let master = pair.master;
+    let data_app = app.clone();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    let text = String::from_utf8_lossy(&buffer[..count]).to_string();
+                    let _ = data_app.emit("terminal:data", text);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = data_app.emit("terminal:exit", ());
+    });
+    *state.terminal.lock().await = Some(TerminalHandle {
+        master,
+        writer,
+        child,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn write_terminal(state: State<'_, AppState>, data: String) -> Result<(), String> {
+    if let Some(terminal) = state.terminal.lock().await.as_mut() {
+        use std::io::Write;
+        terminal
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|e| format!("写入终端失败: {}", e))?;
+        terminal
+            .writer
+            .flush()
+            .map_err(|e| format!("刷新终端失败: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn resize_terminal(
+    state: State<'_, AppState>,
+    rows: u16,
+    cols: u16,
+) -> Result<(), String> {
+    if let Some(terminal) = state.terminal.lock().await.as_mut() {
+        terminal
+            .master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("调整终端大小失败: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_terminal(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(mut terminal) = state.terminal.lock().await.take() {
+        let _ = terminal.child.kill();
     }
     Ok(())
 }
@@ -2353,6 +2472,10 @@ pub fn run() {
             stop_lsp,
             start_dap,
             stop_dap,
+            start_terminal,
+            write_terminal,
+            resize_terminal,
+            stop_terminal,
             build_and_run,
             build_and_run_stream,
             cancel_build,

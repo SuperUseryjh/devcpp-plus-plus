@@ -37,6 +37,7 @@ import {
   X,
 } from "lucide-react";
 import { monaco } from "./editor/monaco";
+import { TerminalView } from "./terminal/TerminalView";
 import {
   isLspLanguage,
   languageForPath,
@@ -146,7 +147,7 @@ interface ProblemItem {
 }
 
 type SidebarView = "explorer" | "search" | "problems" | "run" | "settings";
-type PanelTab = "problems" | "output";
+type PanelTab = "problems" | "output" | "terminal";
 type ResizeDirection =
   | "East"
   | "North"
@@ -612,6 +613,7 @@ function App() {
       .onCloseRequested(async (event) => {
         const stopChildren = async () => {
           await invoke("stop_dap").catch(() => undefined);
+          await invoke("stop_terminal").catch(() => undefined);
           await invoke("stop_lsp").catch(() => undefined);
         };
         if (allowCloseRef.current) return;
@@ -4358,7 +4360,11 @@ ${delay} ms 后自动重启 clangd...`);
               >
                 输出
               </button>
-              <button type="button" className="panel-tab" disabled>
+              <button
+                type="button"
+                className={`panel-tab${panelTab === "terminal" ? " active" : ""}`}
+                onClick={() => setPanelTab("terminal")}
+              >
                 <Terminal size={13} /> 终端
               </button>
               <button type="button" className="panel-tab" disabled>
@@ -4385,7 +4391,9 @@ ${delay} ms 后自动重启 clangd...`);
             </div>
           </div>
           <div className="panel-content">
-            {panelTab === "problems" ? (
+            {panelTab === "terminal" ? (
+              <TerminalView root={root} />
+            ) : panelTab === "problems" ? (
               renderProblemList()
             ) : (
               <div className="output-wrap">
