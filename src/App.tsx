@@ -448,6 +448,9 @@ function App() {
   const lspRef = useRef<LspClient | null>(null);
   const dapRef = useRef<DapClient | null>(null);
   const breakpointsRef = useRef<Map<string, Set<number>>>(new Map());
+  const breakpointConditionsRef = useRef<Map<string, Map<number, string>>>(
+    new Map(),
+  );
   const breakpointDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
   const debugLineDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
   const docsRef = useRef(new Map<string, OpenedDoc>());
@@ -500,11 +503,50 @@ function App() {
   const toggleBreakpoint = useCallback((path: string, line: number) => {
     const key = normalizePath(path);
     const current = new Set(breakpointsRef.current.get(key) ?? []);
-    if (current.has(line)) current.delete(line);
-    else current.add(line);
+    if (current.has(line)) {
+      current.delete(line);
+      breakpointConditionsRef.current.get(key)?.delete(line);
+    } else {
+      current.add(line);
+    }
     if (current.size === 0) breakpointsRef.current.delete(key);
     else breakpointsRef.current.set(key, current);
     setBreakpointVersion((value) => value + 1);
+  }, []);
+
+  const setBreakpointCondition = useCallback(
+    (path: string, line: number, rawCondition: string) => {
+      const key = normalizePath(path);
+      const condition = rawCondition.trim();
+      const conditions =
+        breakpointConditionsRef.current.get(key) ?? new Map<number, string>();
+      if (condition) conditions.set(line, condition);
+      else conditions.delete(line);
+      if (conditions.size === 0) breakpointConditionsRef.current.delete(key);
+      else breakpointConditionsRef.current.set(key, conditions);
+      setBreakpointVersion((value) => value + 1);
+    },
+    [],
+  );
+
+  const syncBreakpointsForPath = useCallback(async (path: string) => {
+    const dap = dapRef.current;
+    if (!dap) return;
+    const key = normalizePath(path);
+    const lines = Array.from(breakpointsRef.current.get(key) ?? []).sort(
+      (a, b) => a - b,
+    );
+    try {
+      await dap.request("setBreakpoints", {
+        source: { path: key },
+        breakpoints: lines.map((line) => {
+          const condition = breakpointConditionsRef.current.get(key)?.get(line);
+          return condition ? { line, condition } : { line };
+        }),
+      });
+    } catch (error) {
+      setDebugError(String(error));
+    }
   }, []);
 
   useEffect(() => {
@@ -521,7 +563,16 @@ function App() {
         range: new monaco.Range(line, 1, line, 1),
         options: {
           glyphMarginClassName: "breakpoint-glyph",
-          glyphMarginHoverMessage: { value: `断点 · 第 ${line} 行` },
+          glyphMarginHoverMessage: {
+            value:
+              `断点 · 第 ${line} 行` +
+              (breakpointConditionsRef.current
+                .get(normalizePath(path))
+                ?.get(line)
+                ? `
+条件: ${breakpointConditionsRef.current.get(normalizePath(path))?.get(line)}`
+                : ""),
+          },
         },
       })),
     );
@@ -2112,7 +2163,12 @@ function App() {
       for (const [path, lines] of breakpointsRef.current) {
         await dap.request("setBreakpoints", {
           source: { path },
-          breakpoints: Array.from(lines).map((line) => ({ line })),
+          breakpoints: Array.from(lines).map((line) => {
+            const condition = breakpointConditionsRef.current
+              .get(path)
+              ?.get(line);
+            return condition ? { line, condition } : { line };
+          }),
         });
       }
       const launch = dap.request("launch", {
@@ -3382,6 +3438,19 @@ ${delay} ms 后自动重启 clangd...`);
       );
     });
 
+  const breakpointRows = Array.from(breakpointsRef.current.entries())
+    .flatMap(([path, lines]) =>
+      Array.from(lines).map((line) => ({
+        path,
+        line,
+        condition: breakpointConditionsRef.current.get(path)?.get(line) ?? "",
+      })),
+    )
+    .sort(
+      (a, b) =>
+        a.path.localeCompare(b.path) || a.line - b.line,
+    );
+
   const allProblems = [...problems, ...buildProblems];
   const renderProblemList = (): ReactNode =>
     allProblems.length === 0 ? (
@@ -3519,6 +3588,44 @@ ${delay} ms 后自动重启 clangd...`);
               <Play size={15} /> 编译并调试
               <kbd>F5</kbd>
             </button>
+            <div className="settings-title">断点</div>
+            {breakpointRows.length === 0 ? (
+              <div className="side-note">暂无断点；点击行号左侧空白或按 F9 添加。</div>
+            ) : (
+              <div className="breakpoint-list">
+                {breakpointRows.map((row) => (
+                  <div className="breakpoint-row" key={`${row.path}:${row.line}`}>
+                    <span className="breakpoint-location" title={row.path}>
+                      {row.path.split(/[\/]/).pop()}:{row.line}
+                    </span>
+                    <button
+                      type="button"
+                      className="breakpoint-condition"
+                      onClick={() =>
+                        askText("断点条件", row.condition, (value) => {
+                          setBreakpointCondition(row.path, row.line, value);
+                          void syncBreakpointsForPath(row.path);
+                          setStatus("断点条件已更新");
+                        })
+                      }
+                    >
+                      {row.condition || "条件…"}
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      title="删除断点"
+                      onClick={() => {
+                        toggleBreakpoint(row.path, row.line);
+                        void syncBreakpointsForPath(row.path);
+                      }}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <button
               type="button"
               className="side-button"

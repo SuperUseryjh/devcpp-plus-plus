@@ -1840,3 +1840,45 @@ textarea:focus-visible {
   flex: none;
   padding: 2px 8px;
 }
+
+.breakpoint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.breakpoint-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.breakpoint-location {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #cccccc;
+}
+
+.breakpoint-condition {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #9cdcfe;
+  padding: 1px 4px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.breakpoint-condition:hover {
+  background: var(--bg-hover);
+}
