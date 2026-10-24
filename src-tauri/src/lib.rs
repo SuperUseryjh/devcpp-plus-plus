@@ -525,9 +525,19 @@ fn rename_path(root: String, from: String, to: String) -> Result<(), String> {
     }
     if source.is_dir() {
         let source_key = normalize_path_for_compare(&source);
-        let target_key = normalize_path_for_compare(&target);
+        let target_parent = target
+            .parent()
+            .ok_or_else(|| "目标路径没有父目录".to_string())?;
+        let target_parent_key = normalize_path_for_compare(target_parent);
+        let target_name = target
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         let source_key = source_key.strip_prefix(r"\\?\").unwrap_or(&source_key);
-        let target_key = target_key.strip_prefix(r"\\?\").unwrap_or(&target_key);
+        let target_parent_key = target_parent_key
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&target_parent_key);
+        let target_key = format!("{target_parent_key}\\{target_name}");
         if target_key == source_key || target_key.starts_with(&format!("{source_key}\\")) {
             return Err("不能把文件夹移动到自身或其子目录".to_string());
         }
